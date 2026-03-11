@@ -1,0 +1,10 @@
+google-genai>=1.0.0
+requests
+moviepy>=2.0.0
+Pillow>=11.0.0
+pydub
+audioop-lts  # required for pydub on Python 3.13+ (audioop was removed from stdlib)
+ffmpeg-python
+python-dotenv
+tqdm
+numpy

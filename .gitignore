@@ -1,0 +1,35 @@
+# Secrets — never commit
+.env
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Generated output (re-run pipeline to recreate)
+output/
+logs/
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# Optional: uncomment to track empty output structure
+# !output/.gitkeep
+# !logs/.gitkeep
