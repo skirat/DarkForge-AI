@@ -28,7 +28,8 @@ Rules:
   2. narration — the exact text the narrator will read for this scene
   3. visual_prompt — a vivid, specific description of what the viewer should see (different for each scene)
   4. duration_seconds — estimated screen time
-- CRITICAL: Output a single, complete, valid JSON array. Escape any quotes inside strings. Do not truncate.
+- CRITICAL: Output one complete valid JSON array. Escape double quotes inside string values. Do not stop until the array is closed.
+- Keep each visual_prompt concise (about 40 words or fewer) so the full array fits in one response.
 
 Return ONLY a JSON array:
 [
@@ -46,7 +47,29 @@ def _call_scene_api(client: genai.Client, script: str) -> str:
             system_instruction=SYSTEM_PROMPT,
             response_mime_type="application/json",
             temperature=0.5,
-            max_output_tokens=16384,
+            # Large: many scenes × (narration + visual_prompt) must not be cut off mid-JSON.
+            max_output_tokens=65536,
+        ),
+    ).text
+
+
+def _repair_scenes_json(client: genai.Client, broken_text: str) -> str:
+    """Ask the model to fix truncated or invalid scene JSON."""
+    # Cap input size so the repair call stays within context limits.
+    snippet = broken_text[:100000]
+    return client.models.generate_content(
+        model=TEXT_MODEL,
+        contents=(
+            "The text below was meant to be a JSON array only. Each element must have: "
+            'scene_id (int), narration (string), visual_prompt (string), duration_seconds (number). '
+            "It may be truncated or malformed. Return ONLY a complete valid JSON array. "
+            "Escape double quotes inside strings. Recover as many complete scenes as possible.\n\n"
+            + snippet
+        ),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.2,
+            max_output_tokens=65536,
         ),
     ).text
 
@@ -61,7 +84,14 @@ def generate_scenes(client: genai.Client, script: str) -> list[dict]:
     except json.JSONDecodeError as e:
         logger.warning("Scene JSON parse failed (%s), retrying once …", e)
         text = _call_scene_api(client, script)
-        scenes = parse_json_response(text)
+        try:
+            scenes = parse_json_response(text)
+        except json.JSONDecodeError as e2:
+            logger.warning(
+                "Scene JSON still invalid (%s), attempting repair pass …", e2
+            )
+            text = _repair_scenes_json(client, text)
+            scenes = parse_json_response(text)
 
     if not isinstance(scenes, list):
         raise ValueError("Expected a JSON array of scenes")

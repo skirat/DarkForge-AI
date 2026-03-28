@@ -39,8 +39,9 @@ VEO_MODELS = [
     "veo-3.1-fast-generate-preview",
 ]
 
-# --- TTS ---
-TTS_VOICE = "Kore"
+# --- TTS (Gemini prebuilt voices: https://ai.google.dev/gemini-api/docs/speech-generation#voices) ---
+# Default Algenib = gravelly male (strong for horror). Override: Charon (narrator), Gacrux (mature), Orus (firm).
+TTS_VOICE = (os.getenv("TTS_VOICE", "Algenib") or "Algenib").strip()
 TTS_SAMPLE_RATE = 24000
 TTS_SAMPLE_WIDTH = 2
 TTS_CHANNELS = 1
@@ -52,6 +53,8 @@ IMAGES_DIR = OUTPUT_DIR / "images"
 AUDIO_DIR = OUTPUT_DIR / "audio"
 VIDEO_DIR = OUTPUT_DIR / "video"
 HERO_VIDEOS_DIR = OUTPUT_DIR / "hero_videos"
+REMOTION_RENDER_DIR = OUTPUT_DIR / "remotion_clips"
+REMOTION_CLIPS_DIR = BASE_DIR / "remotion_clips"
 ASSETS_DIR = BASE_DIR / "assets"
 MUSIC_DIR = ASSETS_DIR / "music"
 FONTS_DIR = ASSETS_DIR / "fonts"
@@ -76,6 +79,19 @@ SCENE_DURATION_DEFAULT = 15  # seconds per scene (will vary by narration length)
 HERO_SCENE_COUNT = max(0, int(os.getenv("HERO_SCENE_COUNT", "0") or 0))
 VEO_POLL_INTERVAL_SEC = 15
 VEO_POLL_TIMEOUT_SEC = 600
+
+# --- Remotion (video clips when Veo unavailable; requires Node + npm install in remotion_clips/) ---
+ENABLE_REMOTION = os.getenv("ENABLE_REMOTION", "1").strip().lower() in ("1", "true", "yes")
+# Off by default: motion-graphics-only reads as video; enable to blend animated scene PNG.
+REMOTION_EMBED_SCENE_IMAGE = os.getenv("REMOTION_EMBED_SCENE_IMAGE", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+REMOTION_COMPOSITION_ID = (os.getenv("REMOTION_COMPOSITION_ID", "DarkForgeScene").strip() or "DarkForgeScene")
+REMOTION_RENDER_TIMEOUT_SEC = max(60, int(os.getenv("REMOTION_RENDER_TIMEOUT_SEC", "900") or 900))
+# Skip code-rain / vignette on Remotion-backed scenes (they already have motion graphics)
+REMOTION_SKIP_OVERLAY = os.getenv("REMOTION_SKIP_OVERLAY", "0").strip().lower() in ("1", "true", "yes")
 
 # --- Retry / Parallelism ---
 MAX_RETRIES = 5

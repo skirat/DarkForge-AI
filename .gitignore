@@ -23,6 +23,13 @@ output/
 logs/
 *.log
 
+# Node (Remotion)
+remotion_clips/node_modules/
+remotion_clips/out/
+remotion_clips/public/shorts/source.mp4
+remotion_clips/public/df_render/*
+!remotion_clips/public/df_render/.gitkeep
+
 # IDE / OS
 .idea/
 .vscode/

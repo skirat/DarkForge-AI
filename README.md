@@ -20,6 +20,9 @@ python3 -m venv .venv && source .venv/bin/activate
 # 3. Install dependencies
 pip install -r requirements.txt
 
+# 3b. Remotion (Node 18+) — real MP4 clips for scenes where Veo is unavailable
+cd remotion_clips && npm install && cd ..
+
 # 4. Set your Gemini API key(s)
 cp .env.example .env
 # Edit .env: GEMINI_API_KEY=your_key
@@ -39,8 +42,11 @@ The final video will be at `output/video/video.mp4`.
 ## Requirements
 
 - Python 3.11+
+- **Node.js 18+** and npm (for [Remotion](https://www.remotion.dev/docs) scene clips — run `npm install` in `remotion_clips/`)
 - FFmpeg installed and on `PATH`
 - A Google Gemini API key (Gemini 2.5 Flash, Gemini TTS; images use **Gemini 2.5 Flash Image** by default, free tier). For paid Imagen 4 set `IMAGE_MODEL=imagen-4.0-fast-generate-001` in `.env`.
+
+If Node is missing or `remotion_clips` is not installed, the pipeline skips Remotion and falls back to image + motion for scenes without Veo.
 
 ## Pipeline Steps
 
@@ -51,10 +57,28 @@ The final video will be at `output/video/video.mp4`.
 | 3 | `scene_generator.py` | Break into 20–35 scenes for visual variety |
 | 4 | `image_prompt_generator.py` | Refine visuals into cinematic Imagen prompts |
 | 5 | `image_generator.py` | Generate images in parallel (one API key per worker) |
-| 6 | `hero_video_generator.py` | **Hybrid:** Generate a few “hero” scenes with Veo (real video); rest use images + motion |
+| 6 | `hero_video_generator.py` | Veo real video per hero scene (`HERO_SCENE_COUNT=0` = all scenes) |
 | 7 | `voiceover_generator.py` | TTS per scene, keys used in round-robin |
-| 8 | `music_manager.py` | Select background music, then build video with ducking/transitions |
-| 9 | `video_builder.py` | Cinematic assembly: hero Veo clips + image/motion, overlays, subtitles, color grading |
+| 8 | `remotion_renderer.py` | **Remotion:** render motion-graphic MP4 for scenes without Veo (see below) |
+| 9 | `music_manager.py` | Select background music |
+| 10 | `video_builder.py` | Assembly: **Veo → Remotion → image+motion**, ducking, transitions, color grade |
+| 11 | `youtube_assets.py` | YouTube title, description, tags, thumbnail |
+
+### Visual priority per scene
+
+1. **Veo** MP4 when generation succeeded.  
+2. **Remotion** MP4 (animated gradient, scanlines, optional embedded scene image).  
+3. **Image + Ken Burns** / glitch (last resort).
+
+This keeps the final video **video-first** instead of a slideshow when Veo quota fails.
+
+### Remotion + Claude Code (optional authoring)
+
+- **Install deps:** `cd remotion_clips && npm install`
+- **Preview:** `npm run dev` — opens [Remotion Studio](https://www.remotion.dev/docs) in the browser.
+- **Claude Code workflow:** see [Remotion + Claude Code guide (2026)](https://docs.google.com/document/d/1dSK3P6eZsm-63Jy2q3FAQq2MHYM6moSCNLOPEq_h2Ew/mobilebasic) — optional: `npx skills add remotion-dev/skills` inside `remotion_clips/` so Claude has Remotion Agent Skills when editing compositions.
+- **Env:** `ENABLE_REMOTION=0` disables Remotion. **`REMOTION_EMBED_SCENE_IMAGE=1`** overlays the scene PNG with heavy parallax motion; default **`0`** is full motion graphics (matrix/grid/orbs) so clips are not “one photo + text” slideshows. After changing the Remotion composition, delete `output/remotion_clips/*.mp4` to force re-render. `REMOTION_SKIP_OVERLAY=1` skips code-rain/vignette on Remotion-backed scenes in the final MoviePy pass (see `.env.example`).
+- **YouTube Shorts (edit in Studio):** Composition **`ShortsHighlightReel`** (1080×1920 @ 30fps) uses `@remotion/media` + `@remotion/captions` (Remotion skill patterns: trim segments, TikTok-style pages, bottom red captions). Download the source with `yt-dlp` (example: `yt-dlp -f "bv*+ba/b" --merge-output-format mp4 -o "remotion_clips/public/shorts/source.mp4" <youtube-url>`), set **`placeholder`** to **`false`** in the composition props, then edit **`segments`** (hook / middle / payoff from the long video) and **`captions`** (`Caption[]` with `startMs`/`endMs` on the **final cut** timeline). Render: `npx remotion render src/index.ts ShortsHighlightReel out/shorts.mp4`.
 
 ## Multiple API keys (faster, no rate limits)
 
@@ -73,7 +97,7 @@ GEMINI_API_KEY_4=your_fourth_key
 
 ## Hero scenes (Veo / Google Labs Flow)
 
-The pipeline uses a **hybrid** approach: a few “hero” scenes are generated as real short videos with **Veo** (Google’s video model); the rest use static images + motion effects. Hero scenes are chosen automatically (first, middle, last by default). Set `HERO_SCENE_COUNT` in `config.py` (default `3`). Veo requires supported/paid access; if Veo fails for a scene, that scene falls back to the generated image + motion. Optional: set `VEO_MODEL` in `.env` (e.g. `veo-2.0-generate-001` or `veo-3.1-generate-preview`).
+With **`HERO_SCENE_COUNT=0`** (default in `config.py`), the pipeline tries **Veo** for every scene. If Veo fails (quota, etc.), **Remotion** renders a full MP4 for that scene when Node + `remotion_clips` are set up; otherwise the scene uses **image + motion**. Set `HERO_SCENE_COUNT=3` to limit Veo to a subset of scenes (first/middle/last pattern). Veo models are cycled per `VEO_MODELS` in `config.py`.
 
 ## Background music
 
@@ -91,13 +115,18 @@ DarkForge AI/                  # Project root
 ├── pipeline.py                # CLI entry point
 ├── requirements.txt
 ├── .env.example
+├── remotion_clips/            # Remotion project (npm install; DarkForgeScene composition)
+│   ├── src/
+│   ├── public/df_render/      # Copied scene images at render time (gitignored)
+│   └── package.json
 ├── modules/
 │   ├── youtube_metadata.py
 │   ├── script_generator.py
 │   ├── scene_generator.py
 │   ├── image_prompt_generator.py
 │   ├── image_generator.py
-│   ├── hero_video_generator.py   # Veo hero scenes (hybrid)
+│   ├── hero_video_generator.py   # Veo
+│   ├── remotion_renderer.py      # CLI render per scene
 │   ├── voiceover_generator.py
 │   ├── subtitle_generator.py
 │   └── video_builder.py
@@ -110,7 +139,8 @@ DarkForge AI/                  # Project root
 │   └── fonts/                 # Drop a .ttf/.otf font for subtitles
 ├── output/
 │   ├── images/
-│   ├── hero_videos/              # Cached Veo clips for hero scenes
+│   ├── hero_videos/              # Cached Veo clips
+│   ├── remotion_clips/           # Cached Remotion MP4s per scene
 │   ├── audio/
 │   └── video/
 └── logs/
@@ -131,7 +161,7 @@ All tuneable parameters live in `config.py`:
 
 - **Video**: resolution (1920x1080), FPS (30), codec (H.264)
 - **Script**: word count range (1200–1500)
-- **TTS**: voice (`Kore`), sample rate (24 kHz)
+- **TTS**: voice (`Algenib` by default — gravelly; set `TTS_VOICE` in `.env` for others, e.g. `Charon` narrator, `Gacrux` mature), sample rate (24 kHz)
 - **Generation**: retry count (3), thread workers (4), backoff multiplier
 - **Ken Burns**: zoom range (1.0 → 1.15)
 - **Music**: background volume (8%)

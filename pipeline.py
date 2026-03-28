@@ -29,6 +29,7 @@ from config import (  # noqa: E402
     VIDEO_DIR,
     LOGS_DIR,
     HERO_VIDEOS_DIR,
+    REMOTION_RENDER_DIR,
     HERO_SCENE_COUNT,
     TEXT_MODEL,
     IMAGE_MODEL,
@@ -47,6 +48,7 @@ from modules.hero_video_generator import (  # noqa: E402
     pick_hero_scene_ids,
     generate_hero_videos,
 )
+from modules.remotion_renderer import render_remotion_for_scenes  # noqa: E402
 from modules.video_builder import build_video  # noqa: E402
 from modules.youtube_assets import create_youtube_assets  # noqa: E402
 
@@ -58,6 +60,7 @@ STEPS = [
     "Generate images",
     "Generate hero videos (Veo)",
     "Generate voiceover",
+    "Render Remotion clips",
     "Select music",
     "Build video",
     "Create YouTube title, description, thumbnail",
@@ -228,7 +231,15 @@ def run_pipeline(prompt: str, *, fresh: bool = False) -> Path:
         clear_previous_output(logger)
     else:
         logger.info("Resumable run: keeping existing output (use --fresh to clear and start over)")
-    ensure_dirs(OUTPUT_DIR, IMAGES_DIR, AUDIO_DIR, VIDEO_DIR, HERO_VIDEOS_DIR, LOGS_DIR)
+    ensure_dirs(
+        OUTPUT_DIR,
+        IMAGES_DIR,
+        AUDIO_DIR,
+        VIDEO_DIR,
+        HERO_VIDEOS_DIR,
+        REMOTION_RENDER_DIR,
+        LOGS_DIR,
+    )
 
     clients = [genai.Client(api_key=k) for k in GEMINI_API_KEYS]
     primary = clients[0]
@@ -251,6 +262,7 @@ def _run_pipeline_steps(
     image_paths = None
     narration_wav = None
     scene_wavs = None
+    remotion_video_paths: dict[int, Path] | None = None
     bg_music_path = None
 
     try:
@@ -310,21 +322,34 @@ def _run_pipeline_steps(
         narration_wav, scene_wavs = generate_voiceover(clients, scenes)
         progress.update(1)
 
-        # --- Step 8: Select music (theme-based; fallback ambient if no files) ---
+        # --- Step 8: Remotion clips for scenes without Veo (real MP4, not Ken Burns on stills) ---
+        progress.set_postfix_str("remotion")
+        remotion_video_paths = render_remotion_for_scenes(
+            scenes, image_paths, scene_wavs, hero_video_paths or {}
+        )
+        if remotion_video_paths:
+            logger.info(
+                "Remotion clips: %d scene(s) (Veo + Remotion + image fallback as needed)",
+                len(remotion_video_paths),
+            )
+        progress.update(1)
+
+        # --- Step 9: Select music (theme-based; fallback ambient if no files) ---
         progress.set_postfix_str("music")
         bg_music_path = ensure_background_music(scenes=scenes, metadata=metadata)
         progress.update(1)
 
-        # --- Step 9: Build video (hero Veo clips + image/motion, voiceover, music) ---
+        # --- Step 10: Build video (Veo > Remotion > image/motion, voiceover, music) ---
         progress.set_postfix_str("video")
         video_path = build_video(
             scenes, image_paths, scene_wavs,
             bg_music_path=bg_music_path,
             hero_video_paths=hero_video_paths or None,
+            remotion_video_paths=remotion_video_paths or None,
         )
         progress.update(1)
 
-        # --- Step 10: YouTube title, description, tags, thumbnail (Gemini 4 keys, then NanoBanana) ---
+        # --- Step 11: YouTube title, description, tags, thumbnail (Gemini 4 keys, then NanoBanana) ---
         progress.set_postfix_str("YouTube assets")
         create_youtube_assets(OUTPUT_DIR / "metadata.json", OUTPUT_DIR, clients=clients)
         progress.update(1)

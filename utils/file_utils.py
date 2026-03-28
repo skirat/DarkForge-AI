@@ -14,7 +14,17 @@ def parse_json_response(text: str) -> Any:
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
-    return json.loads(text)
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Sometimes the model adds prose after the array; try the outer [...] span.
+        if text.startswith("[") or "[" in text:
+            start = text.find("[")
+            end = text.rfind("]")
+            if start != -1 and end > start:
+                return json.loads(text[start : end + 1])
+        raise
 
 
 def ensure_dirs(*dirs: Path) -> None:

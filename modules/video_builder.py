@@ -34,6 +34,7 @@ from config import (
     COLOR_GRADE_FILTER,
     OUTPUT_DIR,
     VIGNETTE_STRENGTH,
+    REMOTION_SKIP_OVERLAY,
 )
 from modules import effects as fx
 from modules import music_manager
@@ -223,11 +224,13 @@ def build_video(
     scene_wavs: list[Path],
     bg_music_path: Path | list[Path] | None = None,
     hero_video_paths: dict[int, Path] | None = None,
+    remotion_video_paths: dict[int, Path] | None = None,
     output_path: Path | None = None,
 ) -> Path:
     output_path = output_path or (VIDEO_DIR / "video.mp4")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     hero_video_paths = hero_video_paths or {}
+    remotion_video_paths = remotion_video_paths or {}
 
     logger.info("Building cinematic video from %d scenes …", len(scenes))
 
@@ -246,6 +249,7 @@ def build_video(
         audio_clip = AudioFileClip(str(wav_path))
         duration = audio_clip.duration
 
+        from_remotion_bg = False
         if scene_id in hero_video_paths and hero_video_paths[scene_id].exists():
             # Hero scene: use Veo-generated video clip (trim or loop to duration, no motion)
             hero_path = hero_video_paths[scene_id]
@@ -257,6 +261,17 @@ def build_video(
                 n = int(duration / bg.duration) + 1
                 bg = concatenate_videoclips([bg] * n).subclipped(0, duration)
             bg = bg.with_effects([vfx.Resize((VIDEO_WIDTH, VIDEO_HEIGHT))])
+        elif scene_id in remotion_video_paths and remotion_video_paths[scene_id].exists():
+            # Remotion-rendered motion graphic + optional embedded scene image
+            rpath = remotion_video_paths[scene_id]
+            bg = VideoFileClip(str(rpath)).with_fps(VIDEO_FPS)
+            if bg.duration > duration:
+                bg = bg.subclipped(0, duration)
+            elif bg.duration < duration:
+                n = int(duration / bg.duration) + 1
+                bg = concatenate_videoclips([bg] * n).subclipped(0, duration)
+            bg = bg.with_effects([vfx.Resize((VIDEO_WIDTH, VIDEO_HEIGHT))])
+            from_remotion_bg = True
         else:
             # Standard scene: image + motion effects
             img_array = _resize_cover(img_path)
@@ -267,10 +282,12 @@ def build_video(
                 bg = fx.apply_flicker(bg)
 
         # Layer 2: thematic overlay (code rain, scanlines, terminal)
-        overlay = fx.pick_random_overlay(scene, duration)
-
-        # Layer 3: vignette (cinematic darkened edges)
-        vignette = fx.make_vignette_overlay(duration) if VIGNETTE_STRENGTH > 0 else None
+        if from_remotion_bg and REMOTION_SKIP_OVERLAY:
+            overlay = None
+            vignette = None
+        else:
+            overlay = fx.pick_random_overlay(scene, duration)
+            vignette = fx.make_vignette_overlay(duration) if VIGNETTE_STRENGTH > 0 else None
 
         # No burned-in captions: SRT is written as sidecar for upload to YouTube
         layers = [bg]

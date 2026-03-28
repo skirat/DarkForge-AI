@@ -47,6 +47,18 @@ def _is_quota_exhausted(exc: BaseException) -> bool:
     return "429" in msg or "resource_exhausted" in msg
 
 
+def _should_try_next_veo_call(exc: BaseException) -> bool:
+    """True if another model/key might succeed (quota, billing gate, precondition)."""
+    msg = str(exc).lower()
+    if _is_quota_exhausted(exc):
+        return True
+    if "failed_precondition" in msg:
+        return True
+    if "billing" in msg and ("gcp" in msg or "google cloud" in msg):
+        return True
+    return False
+
+
 def generate_hero_video(
     clients: list[genai.Client],
     scene_id: int,
@@ -90,9 +102,9 @@ def generate_hero_video(
                 )
             except Exception as e:
                 last_exc = e
-                if _is_quota_exhausted(e):
+                if _should_try_next_veo_call(e):
                     logger.warning(
-                        "Veo quota exhausted for scene %d (key %d/%d, model %s): %s — trying next key/model",
+                        "Veo rejected for scene %d (key %d/%d, model %s): %s — trying next key/model",
                         scene_id, key_label, n_clients, model, e,
                     )
                     continue
