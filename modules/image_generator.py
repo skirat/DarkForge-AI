@@ -13,7 +13,10 @@ from config import (
     IMAGE_MODEL,
     IMAGES_DIR,
     IMAGE_WORKERS,
+    IMAGE_GEN_MAX_ATTEMPTS,
+    IMAGE_RETRY_ROUND_WAIT_SEC,
     MAX_RETRIES,
+    OPENAI_ENABLED,
     RETRY_BACKOFF,
     RETRY_RATE_LIMIT_WAIT,
     NANOBANANA_API_KEY,
@@ -23,6 +26,29 @@ logger = logging.getLogger("pipeline")
 
 # When rotating to another key after 429, wait briefly to avoid hammering
 ROTATE_KEY_WAIT_SEC = 10.0
+NANOBANANA_MAX_TRIES = 4
+NANOBANANA_RETRY_WAIT_SEC = 8.0
+
+
+def _is_transient_image_error(exc: BaseException) -> bool:
+    """Quota, rate limits, overload — worth another key or later attempt."""
+    msg = str(exc).lower()
+    return any(
+        x in msg
+        for x in (
+            "429",
+            "resource_exhausted",
+            "503",
+            "unavailable",
+            "quota",
+            "rate",
+            "deadline",
+            "timeout",
+            "overloaded",
+            "try again",
+            "too many requests",
+        )
+    )
 
 NANOBANANA_BASE = "https://api.nanobananaapi.ai"
 NANOBANANA_POLL_INTERVAL = 3.0
@@ -41,6 +67,10 @@ def generate_single_image_gemini(
 ) -> bool:
     """Generate a single image (e.g. thumbnail) using Gemini with the given clients. Tries each key on failure. Returns True if saved."""
     if not clients:
+        if OPENAI_ENABLED:
+            from modules.openai_image import generate_openai_image
+
+            return generate_openai_image(prompt, dest, label="thumbnail")
         return False
     use_imagen = IMAGE_MODEL.startswith("imagen-")
     n_clients = len(clients)
@@ -81,6 +111,11 @@ def generate_single_image_gemini(
                 wait,
             )
             time.sleep(wait)
+    if OPENAI_ENABLED:
+        from modules.openai_image import generate_openai_image
+
+        if generate_openai_image(prompt, dest, label="thumbnail"):
+            return True
     return False
 
 
@@ -167,19 +202,46 @@ def _generate_single(
         logger.debug("Cached image for scene %d", scene_id)
         return dest
 
-    # 1. Try NanoBanana first (if configured)
-    if NANOBANANA_API_KEY and _try_nanobanana(prompt, dest):
-        logger.info("Scene %d image saved (NanoBanana) → %s", scene_id, filename)
-        return dest
+    # 1. Try NanoBanana first (if configured) — a few attempts with backoff
+    if NANOBANANA_API_KEY:
+        for nb_try in range(1, NANOBANANA_MAX_TRIES + 1):
+            if _try_nanobanana(prompt, dest):
+                logger.info(
+                    "Scene %d image saved (NanoBanana) → %s (try %d/%d)",
+                    scene_id,
+                    filename,
+                    nb_try,
+                    NANOBANANA_MAX_TRIES,
+                )
+                return dest
+            if nb_try < NANOBANANA_MAX_TRIES:
+                logger.warning(
+                    "NanoBanana failed for scene %d (try %d/%d) — retrying in %.1fs",
+                    scene_id,
+                    nb_try,
+                    NANOBANANA_MAX_TRIES,
+                    NANOBANANA_RETRY_WAIT_SEC,
+                )
+                time.sleep(NANOBANANA_RETRY_WAIT_SEC)
 
-    # 2. Fall back to Gemini (gemini-2.5-flash-image or Imagen) with key rotation
+    # 2. Gemini / Imagen: rotate keys many times; pause between full key cycles on quota
     use_imagen = IMAGE_MODEL.startswith("imagen-")
     last_err: Exception | None = None
     n_clients = len(clients)
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        # Rotate key on each attempt: try key_index, then key_index+1, ... so exhausted keys are skipped
-        client = clients[(key_index + attempt - 1) % n_clients]
+    if n_clients == 0:
+        if OPENAI_ENABLED:
+            from modules.openai_image import generate_openai_image
+
+            if generate_openai_image(prompt, dest, label=f"scene {scene_id}"):
+                return dest
+        return _create_placeholder(dest)
+    max_attempts = IMAGE_GEN_MAX_ATTEMPTS
+    attempt = 0
+
+    while attempt < max_attempts:
+        client = clients[(key_index + attempt) % n_clients]
+        key_slot = (key_index + attempt) % n_clients + 1
         try:
             if use_imagen:
                 response = client.models.generate_images(
@@ -201,33 +263,77 @@ def _generate_single(
                     ),
                 )
                 _save_image_from_content_response(response, dest)
-            logger.info("Scene %d image saved → %s", scene_id, filename)
+            logger.info("Scene %d image saved → %s (after %d attempt(s))", scene_id, filename, attempt + 1)
             return dest
         except Exception as exc:
             last_err = exc
+            attempt += 1
             err_msg = str(exc).strip() or type(exc).__name__
             if len(err_msg) > 200:
                 err_msg = err_msg[:197] + "..."
-            err_msg_safe = err_msg.replace("%", "%%")  # avoid % breaking format
+            err_msg_safe = err_msg.replace("%", "%%")
+            transient = _is_transient_image_error(exc)
             is_rate_limit = "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg
-            if is_rate_limit and n_clients > 1:
-                # Try next key soon; avoid long wait when we have other keys
-                wait = ROTATE_KEY_WAIT_SEC
-                logger.warning(
-                    "Image gen failed for scene %d (attempt %d/%d, key %d/%d): %s – trying next key in %.1fs",
-                    scene_id, attempt, MAX_RETRIES, (key_index + attempt - 1) % n_clients + 1, n_clients,
-                    err_msg_safe, wait,
-                )
-            else:
-                wait = RETRY_RATE_LIMIT_WAIT if is_rate_limit else RETRY_BACKOFF ** attempt
-                logger.warning(
-                    "Image gen failed for scene %d (attempt %d/%d): %s – retrying in %.1fs",
-                    scene_id, attempt, MAX_RETRIES, err_msg_safe, wait,
-                )
-            time.sleep(wait)
 
-    logger.error("Image gen failed permanently for scene %d: %s", scene_id, str(last_err).replace("%", "%%"))
-    # 3. Final fallback: placeholder
+            if attempt >= max_attempts:
+                break
+
+            full_key_cycle = (
+                n_clients > 1 and attempt > 0 and attempt % n_clients == 0
+            )
+            single_key_breather = (
+                n_clients == 1 and attempt > 0 and attempt % 12 == 0
+            )
+            if full_key_cycle or single_key_breather:
+                logger.warning(
+                    "Image gen scene %d: quota pause after %d/%d attempts — %.1fs (%s)",
+                    scene_id,
+                    attempt,
+                    max_attempts,
+                    IMAGE_RETRY_ROUND_WAIT_SEC,
+                    err_msg_safe[:120],
+                )
+                time.sleep(IMAGE_RETRY_ROUND_WAIT_SEC)
+            elif transient and n_clients > 1:
+                wait = min(ROTATE_KEY_WAIT_SEC, 60.0)
+                logger.warning(
+                    "Image gen failed scene %d (attempt %d/%d, key %d/%d): %s — next key in %.1fs",
+                    scene_id,
+                    attempt,
+                    max_attempts,
+                    key_slot,
+                    n_clients,
+                    err_msg_safe,
+                    wait,
+                )
+                time.sleep(wait)
+            else:
+                wait = min(
+                    RETRY_RATE_LIMIT_WAIT if is_rate_limit else RETRY_BACKOFF ** min(attempt, 10),
+                    180.0,
+                )
+                logger.warning(
+                    "Image gen failed scene %d (attempt %d/%d): %s — retry in %.1fs",
+                    scene_id,
+                    attempt,
+                    max_attempts,
+                    err_msg_safe,
+                    wait,
+                )
+                time.sleep(wait)
+
+    if OPENAI_ENABLED:
+        from modules.openai_image import generate_openai_image
+
+        if generate_openai_image(prompt, dest, label=f"scene {scene_id}"):
+            return dest
+
+    logger.error(
+        "Image gen exhausted after %d attempts for scene %d: %s — using placeholder",
+        max_attempts,
+        scene_id,
+        str(last_err).replace("%", "%%") if last_err else "unknown",
+    )
     dest = _create_placeholder(dest)
     return dest
 
@@ -251,19 +357,26 @@ def generate_images(
     output_dir = output_dir or IMAGES_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
     clients = clients or []  # allow single-client callers to pass [client]
-    if not clients:
-        raise ValueError("At least one Gemini client is required")
+    if not clients and not OPENAI_ENABLED and not NANOBANANA_API_KEY:
+        raise ValueError(
+            "Need at least one GEMINI_API_KEY, or set OPENAI_API_KEY / NANOBANANA_API_KEY for images"
+        )
 
+    n_keys = max(1, len(clients))
+    workers = IMAGE_WORKERS if clients else min(IMAGE_WORKERS, 4)
     logger.info(
-        "Generating %d scene images (workers=%d, keys=%d) …",
-        len(image_prompts), IMAGE_WORKERS, len(clients),
+        "Generating %d scene images (workers=%d, gemini_keys=%d, openai_fallback=%s) …",
+        len(image_prompts),
+        workers,
+        len(clients),
+        OPENAI_ENABLED,
     )
     paths: dict[int, Path] = {}
 
-    with ThreadPoolExecutor(max_workers=IMAGE_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {}
         for i, p in enumerate(image_prompts):
-            key_index = i % len(clients)
+            key_index = i % n_keys if clients else 0
             fut = pool.submit(
                 _generate_single,
                 clients,

@@ -4,6 +4,7 @@ animated subtitles, audio ducking, SFX, and color grading.
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 from pathlib import Path
 
@@ -13,9 +14,11 @@ from moviepy import (
     AudioFileClip,
     VideoFileClip,
     TextClip,
+    ImageClip,
     CompositeVideoClip,
     CompositeAudioClip,
     concatenate_videoclips,
+    concatenate_audioclips,
     vfx,
 )
 from PIL import Image
@@ -35,10 +38,12 @@ from config import (
     OUTPUT_DIR,
     VIGNETTE_STRENGTH,
     REMOTION_SKIP_OVERLAY,
+    SCENE_NARRATION_GAP_SEC,
 )
 from modules import effects as fx
 from modules import music_manager
 from modules import sfx_manager
+from modules.hero_video_generator import get_hero_paths_for_scene
 from utils.ffmpeg_utils import color_grade
 
 logger = logging.getLogger("pipeline")
@@ -164,6 +169,41 @@ def _apply_transition(clip: VideoClip, ttype: str) -> VideoClip:
     return clip
 
 
+def _silent_audio_clip(duration_sec: float, ref: AudioFileClip) -> AudioFileClip:
+    """Gap padding; temp WAV cleaned up by OS after process exit."""
+    from pydub import AudioSegment
+
+    ms = max(1, int(duration_sec * 1000))
+    seg = AudioSegment.silent(duration=ms)
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    seg.export(path, format="wav")
+    return AudioFileClip(path)
+
+
+def _extend_video_to_speech_duration(bg: VideoClip, speech_dur: float) -> VideoClip:
+    """Trim long clips; if short, hold last frame instead of looping the same clip."""
+    if bg.duration > speech_dur:
+        return bg.subclipped(0, speech_dur)
+    if bg.duration < speech_dur:
+        short = speech_dur - float(bg.duration)
+        t = max(0.0, float(bg.duration) - 1.0 / max(VIDEO_FPS, 1))
+        frame = bg.get_frame(t)
+        tail = ImageClip(frame).with_duration(short).with_fps(VIDEO_FPS)
+        return concatenate_videoclips([bg, tail])
+    return bg
+
+
+def _append_freeze_last_frame(clip: VideoClip, gap: float, fps: int) -> VideoClip:
+    """Hold last frame for *gap* seconds (paired with silent narration tail)."""
+    if gap <= 0:
+        return clip
+    t = max(0.0, float(clip.duration) - 1.0 / max(fps, 1))
+    frame = clip.get_frame(t)
+    frozen = ImageClip(frame).with_duration(gap).with_fps(fps)
+    return concatenate_videoclips([clip, frozen])
+
+
 # -------------------------------------------------------------------
 #  SRT side-effect writer
 # -------------------------------------------------------------------
@@ -223,7 +263,7 @@ def build_video(
     image_paths: list[Path],
     scene_wavs: list[Path],
     bg_music_path: Path | list[Path] | None = None,
-    hero_video_paths: dict[int, Path] | None = None,
+    hero_video_paths: dict[int, Path | list[Path]] | None = None,
     remotion_video_paths: dict[int, Path] | None = None,
     output_path: Path | None = None,
 ) -> Path:
@@ -241,78 +281,94 @@ def build_video(
     all_sfx: list[tuple[float, Path]] = []
     global_offset = 0.0
 
+    n_scenes = len(sorted_scenes)
     for idx, (scene, img_path, wav_path) in enumerate(
         zip(sorted_scenes, image_paths, scene_wavs)
     ):
         scene_start_times.append(global_offset)
         scene_id = scene["scene_id"]
         audio_clip = AudioFileClip(str(wav_path))
-        duration = audio_clip.duration
+        speech_dur = audio_clip.duration
+        gap = SCENE_NARRATION_GAP_SEC if idx < n_scenes - 1 else 0.0
 
         from_remotion_bg = False
-        if scene_id in hero_video_paths and hero_video_paths[scene_id].exists():
-            # Hero scene: use Veo-generated video clip (trim or loop to duration, no motion)
-            hero_path = hero_video_paths[scene_id]
-            bg = VideoFileClip(str(hero_path)).with_fps(VIDEO_FPS)
-            if bg.duration > duration:
-                bg = bg.subclipped(0, duration)
-            elif bg.duration < duration:
-                # Loop hero clip to fill scene duration
-                n = int(duration / bg.duration) + 1
-                bg = concatenate_videoclips([bg] * n).subclipped(0, duration)
+        hero_paths = get_hero_paths_for_scene(hero_video_paths, scene_id)
+        if hero_paths:
+            # Hero: concatenate distinct Veo clips in order; freeze last frame if still short (no loop)
+            clips_v = [VideoFileClip(str(p)).with_fps(VIDEO_FPS) for p in hero_paths]
+            bg = concatenate_videoclips(clips_v)
             bg = bg.with_effects([vfx.Resize((VIDEO_WIDTH, VIDEO_HEIGHT))])
+            bg = _extend_video_to_speech_duration(bg, speech_dur)
         elif scene_id in remotion_video_paths and remotion_video_paths[scene_id].exists():
-            # Remotion-rendered motion graphic + optional embedded scene image
             rpath = remotion_video_paths[scene_id]
             bg = VideoFileClip(str(rpath)).with_fps(VIDEO_FPS)
-            if bg.duration > duration:
-                bg = bg.subclipped(0, duration)
-            elif bg.duration < duration:
-                n = int(duration / bg.duration) + 1
-                bg = concatenate_videoclips([bg] * n).subclipped(0, duration)
             bg = bg.with_effects([vfx.Resize((VIDEO_WIDTH, VIDEO_HEIGHT))])
+            bg = _extend_video_to_speech_duration(bg, speech_dur)
             from_remotion_bg = True
         else:
-            # Standard scene: image + motion effects
             img_array = _resize_cover(img_path)
-            bg = fx.pick_random_motion(img_array, duration)
+            bg = fx.pick_random_motion(img_array, speech_dur)
             if fx.should_apply_glitch(scene):
                 bg = fx.apply_glitch(bg)
             elif fx.should_apply_flicker(scene):
                 bg = fx.apply_flicker(bg)
 
-        # Layer 2: thematic overlay (code rain, scanlines, terminal)
         if from_remotion_bg and REMOTION_SKIP_OVERLAY:
             overlay = None
             vignette = None
         else:
-            overlay = fx.pick_random_overlay(scene, duration)
-            vignette = fx.make_vignette_overlay(duration) if VIGNETTE_STRENGTH > 0 else None
+            overlay = fx.pick_random_overlay(scene, speech_dur)
+            vignette = (
+                fx.make_vignette_overlay(speech_dur) if VIGNETTE_STRENGTH > 0 else None
+            )
 
-        # No burned-in captions: SRT is written as sidecar for upload to YouTube
         layers = [bg]
         if overlay is not None:
             layers.append(overlay)
         if vignette is not None:
             layers.append(vignette)
 
-        composite = CompositeVideoClip(layers, size=(VIDEO_WIDTH, VIDEO_HEIGHT))
-        composite = composite.with_audio(audio_clip).with_duration(duration)
+        composite = CompositeVideoClip(layers, size=(VIDEO_WIDTH, VIDEO_HEIGHT)).with_duration(
+            speech_dur
+        )
+        if gap > 0:
+            composite = _append_freeze_last_frame(composite, gap, VIDEO_FPS)
+        scene_dur = float(composite.duration)
 
-        # Transitions: fade-in on first scene, then varied transition between every scene
-        ttype = TRANSITION_TYPES[idx % len(TRANSITION_TYPES)]
+        if gap > 0:
+            full_audio = concatenate_audioclips(
+                [audio_clip, _silent_audio_clip(gap, audio_clip)]
+            )
+        else:
+            full_audio = audio_clip
+        composite = composite.with_audio(full_audio).with_duration(scene_dur)
+
+        curr_hero = len(get_hero_paths_for_scene(hero_video_paths, scene_id)) > 0
+        if idx > 0:
+            prev_id = sorted_scenes[idx - 1]["scene_id"]
+            prev_hero = len(get_hero_paths_for_scene(hero_video_paths, prev_id)) > 0
+        else:
+            prev_hero = False
+        if prev_hero and curr_hero:
+            ttype = "fade_black"
+        else:
+            ttype = TRANSITION_TYPES[idx % len(TRANSITION_TYPES)]
         composite = _apply_transition(composite, ttype)
+        if idx < n_scenes - 1:
+            composite = composite.with_effects(
+                [vfx.CrossFadeOut(CROSSFADE_DURATION)]
+            )
 
         scene_clips.append(composite)
 
-        # Track narration timing for music ducking
-        narration_segments.append((global_offset, global_offset + duration))
+        narration_segments.append((global_offset, global_offset + speech_dur))
 
-        # Collect SFX
-        sfx_hits = sfx_manager.get_sfx_for_scene(scene, global_offset, duration)
+        sfx_hits = sfx_manager.get_sfx_for_scene(scene, global_offset, speech_dur)
         all_sfx.extend(sfx_hits)
 
-        global_offset += duration - CROSSFADE_DURATION if idx > 0 else duration
+        global_offset += (
+            scene_dur - CROSSFADE_DURATION if idx > 0 else scene_dur
+        )
 
     # Concatenate scenes
     if len(scene_clips) > 1:

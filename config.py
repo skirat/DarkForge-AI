@@ -20,6 +20,12 @@ def _load_api_keys() -> list[str]:
 GEMINI_API_KEYS = _load_api_keys()
 GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
 
+# OpenAI fallback when Gemini text/image quota is exhausted (set in .env; never commit keys).
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
+OPENAI_TEXT_MODEL = (os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
+OPENAI_IMAGE_MODEL = (os.getenv("OPENAI_IMAGE_MODEL", "dall-e-3") or "dall-e-3").strip()
+OPENAI_ENABLED = bool(OPENAI_API_KEY)
+
 # Optional: NanoBanana image API as fallback when Gemini/Imagen image gen fails.
 NANOBANANA_API_KEY = (os.getenv("NANOBANANA_API_KEY") or "").strip()
 
@@ -73,12 +79,19 @@ SCRIPT_WORD_COUNT_MAX = 1500  # ~10 min
 WORDS_PER_MINUTE = 150
 # Scene count target for visual variety (more scenes = more cuts and graphics)
 SCENE_COUNT_MIN = 20
-SCENE_COUNT_MAX = 35
+SCENE_COUNT_MAX = 40  # room for 8s-beat scenes on long scripts; planner may use 16/24s to stay under cap
 SCENE_DURATION_DEFAULT = 15  # seconds per scene (will vary by narration length)
 # Veo-first: try to generate a hero video for each scene. 0 = all scenes; 3 = only 3 hero scenes.
 HERO_SCENE_COUNT = max(0, int(os.getenv("HERO_SCENE_COUNT", "0") or 0))
-VEO_POLL_INTERVAL_SEC = 15
-VEO_POLL_TIMEOUT_SEC = 600
+# How many distinct Veo clips to request per hero scene (estimated from scene duration / typical clip length).
+HERO_VEO_CLIP_SEC = float(os.getenv("HERO_VEO_CLIP_SEC", "8") or 8)
+MAX_HERO_PARTS_PER_SCENE = max(1, int(os.getenv("MAX_HERO_PARTS_PER_SCENE", "8") or 8))
+VEO_POLL_INTERVAL_SEC = max(5, int(os.getenv("VEO_POLL_INTERVAL_SEC", "15") or 15))
+VEO_POLL_TIMEOUT_SEC = max(120, int(os.getenv("VEO_POLL_TIMEOUT_SEC", "600") or 600))
+# Full key × model sweeps before giving up on a hero clip; pause between sweeps for quota recovery
+VEO_MAX_ROUNDS = max(1, int(os.getenv("VEO_MAX_ROUNDS", "6") or 6))
+VEO_RETRY_ROUND_WAIT_SEC = float(os.getenv("VEO_RETRY_ROUND_WAIT_SEC", "90") or 90)
+VEO_KEY_COOLDOWN_SEC = float(os.getenv("VEO_KEY_COOLDOWN_SEC", "15") or 15)
 
 # --- Remotion (video clips when Veo unavailable; requires Node + npm install in remotion_clips/) ---
 ENABLE_REMOTION = os.getenv("ENABLE_REMOTION", "1").strip().lower() in ("1", "true", "yes")
@@ -97,6 +110,9 @@ REMOTION_SKIP_OVERLAY = os.getenv("REMOTION_SKIP_OVERLAY", "0").strip().lower() 
 MAX_RETRIES = 5
 RETRY_BACKOFF = 2.0
 RETRY_RATE_LIMIT_WAIT = 60.0
+# Per-scene image gen: total API attempts (rotates keys); then placeholder only if still failing
+IMAGE_GEN_MAX_ATTEMPTS = max(8, int(os.getenv("IMAGE_GEN_MAX_ATTEMPTS", "48") or 48))
+IMAGE_RETRY_ROUND_WAIT_SEC = float(os.getenv("IMAGE_RETRY_ROUND_WAIT_SEC", "60") or 60)
 # Use one worker per API key when multiple keys are set (max 4)
 IMAGE_WORKERS = min(4, len(GEMINI_API_KEYS)) if GEMINI_API_KEYS else 4
 
@@ -115,11 +131,18 @@ ZOOM_END = 1.15
 PAN_OVERSCAN = 1.25
 
 # --- Transitions ---
-CROSSFADE_DURATION = 0.5
+# Visual overlap between scenes (seconds). Keep ≤ SCENE_NARRATION_GAP_SEC so crossfades sit mostly in silence tails.
+CROSSFADE_DURATION = float(os.getenv("CROSSFADE_DURATION", "0.45") or 0.45)
 TRANSITION_TYPES = ["crossfade", "glitch_cut", "fade_black"]
 GLITCH_CUT_DURATION = 0.3
+# Silence after each scene’s narration (before next scene); holds last video frame. Not applied after final scene.
+SCENE_NARRATION_GAP_SEC = float(os.getenv("SCENE_NARRATION_GAP_SEC", "0.5") or 0.5)
 
 # --- Background Music ---
+# Lyria 3 (Gemini API) — story-prompted 30s instrumental; loops in prepare_music. Needs API access; falls back to assets/music.
+LYRIA_BGM = os.getenv("LYRIA_BGM", "0").strip().lower() in ("1", "true", "yes")
+LYRIA_MODEL = (os.getenv("LYRIA_MODEL", "lyria-3-clip-preview") or "lyria-3-clip-preview").strip()
+
 BG_MUSIC_VOLUME = 0.08
 BG_MUSIC_DUCKED = 0.04
 DUCK_RAMP_SECONDS = 0.3

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from config import NANOBANANA_API_KEY, OUTPUT_DIR
 from modules import image_generator
+from modules.youtube_metadata import normalize_youtube_tags
 
 if TYPE_CHECKING:
     from google import genai
@@ -30,7 +31,7 @@ def create_youtube_assets(
     Reads metadata.json (title, description, tags, thumbnail_prompt) and writes:
     - youtube_title.txt
     - youtube_description.txt
-    - youtube_tags.txt (one tag per line)
+    - youtube_tags.txt (comma-separated tags, 5–6 items)
     - thumbnail.png (Gemini with *clients* if provided, else NanoBanana if NANOBANANA_API_KEY set)
 
     When *clients* is provided (e.g. your 4 Gemini API key clients), thumbnail is generated
@@ -52,7 +53,7 @@ def create_youtube_assets(
     data = json.loads(metadata_path.read_text(encoding="utf-8"))
     title = (data.get("title") or "").strip()
     description = (data.get("description") or "").strip()
-    tags = data.get("tags") or []
+    tags = normalize_youtube_tags(data.get("tags") or [])
     thumbnail_prompt = (data.get("thumbnail_prompt") or "").strip()
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -72,9 +73,9 @@ def create_youtube_assets(
     description_path.write_text("\n".join(desc_lines), encoding="utf-8")
     logger.info("YouTube description → %s", description_path.name)
 
-    # Tags (one per line for easy copy-paste)
+    # Tags (comma-separated for YouTube paste; no extra lines)
     tags_path = output_dir / YOUTUBE_TAGS_FILE
-    tags_path.write_text("\n".join(t for t in tags if isinstance(t, str)), encoding="utf-8")
+    tags_path.write_text(", ".join(tags), encoding="utf-8")
     logger.info("YouTube tags → %s", tags_path.name)
 
     # Thumbnail: try Gemini (same 4 keys) first, then NanoBanana fallback

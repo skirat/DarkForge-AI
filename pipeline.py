@@ -23,6 +23,8 @@ from tqdm import tqdm  # noqa: E402
 from config import (  # noqa: E402
     GEMINI_API_KEY,
     GEMINI_API_KEYS,
+    OPENAI_ENABLED,
+    OPENAI_IMAGE_MODEL,
     OUTPUT_DIR,
     IMAGES_DIR,
     AUDIO_DIR,
@@ -33,12 +35,14 @@ from config import (  # noqa: E402
     HERO_SCENE_COUNT,
     TEXT_MODEL,
     IMAGE_MODEL,
+    WORDS_PER_MINUTE,
 )
 from utils.logger import setup_logger  # noqa: E402
 from utils.file_utils import ensure_dirs, cache_json, cache_text  # noqa: E402
 
 from modules.youtube_metadata import generate_metadata  # noqa: E402
 from modules.script_generator import generate_script  # noqa: E402
+from modules.character_bible import generate_character_bible  # noqa: E402
 from modules.scene_generator import generate_scenes  # noqa: E402
 from modules.image_prompt_generator import generate_image_prompts  # noqa: E402
 from modules.image_generator import generate_images  # noqa: E402
@@ -55,6 +59,7 @@ from modules.youtube_assets import create_youtube_assets  # noqa: E402
 STEPS = [
     "Generate metadata",
     "Generate script",
+    "Generate character bible",
     "Break into scenes",
     "Create image prompts",
     "Generate images",
@@ -155,14 +160,16 @@ def run_pipeline(prompt: str, *, fresh: bool = False) -> Path:
     logger.info("=" * 60)
     logger.info("DarkForge AI Pipeline — starting")
     logger.info("Prompt: %s", prompt)
-    logger.info("API keys: %d", len(GEMINI_API_KEYS))
+    logger.info("API keys: %d Gemini", len(GEMINI_API_KEYS))
+    if OPENAI_ENABLED:
+        logger.info("OpenAI fallback: enabled (text + DALL-E images when Gemini fails)")
     logger.info("=" * 60)
 
     if not GEMINI_API_KEYS:
         logger.error(
             "No Gemini API key set. Add to .env:\n"
             "  GEMINI_API_KEY=your_key\n"
-            "  (Optional: GEMINI_API_KEY_2, GEMINI_API_KEY_3, GEMINI_API_KEY_4 for parallel usage)\n"
+            "  (Optional: GEMINI_API_KEY_2, …; OPENAI_API_KEY for quota fallback on text/images)\n"
             "Get keys at: https://aistudio.google.com/apikey"
         )
         sys.exit(1)
@@ -170,27 +177,40 @@ def run_pipeline(prompt: str, *, fresh: bool = False) -> Path:
     logger.info("Validating %d API key(s) …", len(GEMINI_API_KEYS))
     failures = validate_api_keys(GEMINI_API_KEYS, logger)
     if failures:
-        logger.error("=" * 60)
-        logger.error("API KEY VALIDATION FAILED")
-        logger.error("=" * 60)
-        for label, err in failures:
-            logger.error("%s: %s", label, err)
-        logger.error("")
-        logger.error("Fix or remove the invalid key(s) in .env and re-run.")
-        logger.error("Get valid keys at: https://aistudio.google.com/apikey")
-        logger.error("=" * 60)
-        if logger.handlers:
-            for h in logger.handlers:
-                h.flush()
-        msg = "\n".join([f"  {label}: {err}" for label, err in failures])
-        print(
-            f"\n{'=' * 60}\nAPI KEY VALIDATION FAILED\n{'=' * 60}\n{msg}\n\n"
-            "Fix or remove the invalid key(s) in .env and re-run.\n"
-            "Get valid keys at: https://aistudio.google.com/apikey\n" + "=" * 60,
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    logger.info("All API keys valid.")
+        if OPENAI_ENABLED:
+            logger.warning("=" * 60)
+            logger.warning(
+                "Gemini key validation reported errors — continuing (OpenAI will handle text/image if needed)"
+            )
+            logger.warning("=" * 60)
+            for label, err in failures:
+                logger.warning("%s: %s", label, err[:400] + ("..." if len(err) > 400 else ""))
+            logger.warning("=" * 60)
+        else:
+            logger.error("=" * 60)
+            logger.error("API KEY VALIDATION FAILED")
+            logger.error("=" * 60)
+            for label, err in failures:
+                logger.error("%s: %s", label, err)
+            logger.error("")
+            logger.error("Fix or remove the invalid key(s) in .env and re-run.")
+            logger.error("Or set OPENAI_API_KEY to continue when Gemini quota is exhausted.")
+            logger.error("Get valid keys at: https://aistudio.google.com/apikey")
+            logger.error("=" * 60)
+            if logger.handlers:
+                for h in logger.handlers:
+                    h.flush()
+            msg = "\n".join([f"  {label}: {err}" for label, err in failures])
+            print(
+                f"\n{'=' * 60}\nAPI KEY VALIDATION FAILED\n{'=' * 60}\n{msg}\n\n"
+                "Fix or remove the invalid key(s) in .env and re-run.\n"
+                "Or set OPENAI_API_KEY for fallback when Gemini quota is hit.\n"
+                "Get valid keys at: https://aistudio.google.com/apikey\n" + "=" * 60,
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    else:
+        logger.info("All API keys valid.")
 
     logger.info("Checking image model (%s) with all keys …", IMAGE_MODEL)
     image_failures: list[tuple[str, str]] = []
@@ -204,28 +224,44 @@ def run_pipeline(prompt: str, *, fresh: bool = False) -> Path:
         image_failures.append((label, err))
     else:
         # all keys failed
-        logger.error("=" * 60)
-        logger.error("IMAGE MODEL CHECK FAILED (all %d key(s))", len(GEMINI_API_KEYS))
-        logger.error("=" * 60)
-        logger.error("Model: %s", IMAGE_MODEL)
-        for label, err in image_failures:
-            logger.error("  %s: %s", label, err[:200] + ("..." if len(err) > 200 else ""))
-        logger.error("")
-        logger.error("None of your keys have image quota or access for this model.")
-        logger.error("Wait for quota reset, or set IMAGE_MODEL=gemini-2.5-flash-image and try again.")
-        logger.error("=" * 60)
-        if logger.handlers:
-            for h in logger.handlers:
-                h.flush()
-        msg = "\n".join([f"  {label}: {err[:150]}..." if len(err) > 150 else f"  {label}: {err}" for label, err in image_failures])
-        print(
-            f"\n{'=' * 60}\nIMAGE MODEL CHECK FAILED (all keys)\n{'=' * 60}\n"
-            f"Model: {IMAGE_MODEL}\n\n{msg}\n\n"
-            "None of your keys have image quota or access for this model.\n"
-            "Wait for quota reset, or try again later.\n" + "=" * 60,
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        if OPENAI_ENABLED:
+            logger.warning("=" * 60)
+            logger.warning(
+                "Gemini image model check failed on all keys — scene/thumbnail images will use OpenAI (%s) when Gemini fails per image",
+                OPENAI_IMAGE_MODEL,
+            )
+            logger.warning("=" * 60)
+            for label, err in image_failures:
+                logger.warning("  %s: %s", label, err[:200] + ("..." if len(err) > 200 else ""))
+        else:
+            logger.error("=" * 60)
+            logger.error("IMAGE MODEL CHECK FAILED (all %d key(s))", len(GEMINI_API_KEYS))
+            logger.error("=" * 60)
+            logger.error("Model: %s", IMAGE_MODEL)
+            for label, err in image_failures:
+                logger.error("  %s: %s", label, err[:200] + ("..." if len(err) > 200 else ""))
+            logger.error("")
+            logger.error("None of your keys have image quota or access for this model.")
+            logger.error("Wait for quota reset, or set IMAGE_MODEL=gemini-2.5-flash-image and try again.")
+            logger.error("Or set OPENAI_API_KEY for DALL-E fallback on images.")
+            logger.error("=" * 60)
+            if logger.handlers:
+                for h in logger.handlers:
+                    h.flush()
+            msg = "\n".join(
+                [
+                    f"  {label}: {err[:150]}..." if len(err) > 150 else f"  {label}: {err}"
+                    for label, err in image_failures
+                ]
+            )
+            print(
+                f"\n{'=' * 60}\nIMAGE MODEL CHECK FAILED (all keys)\n{'=' * 60}\n"
+                f"Model: {IMAGE_MODEL}\n\n{msg}\n\n"
+                "None of your keys have image quota or access for this model.\n"
+                "Wait for quota reset, set OPENAI_API_KEY, or try again later.\n" + "=" * 60,
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     if fresh:
         clear_previous_output(logger)
@@ -242,14 +278,11 @@ def run_pipeline(prompt: str, *, fresh: bool = False) -> Path:
     )
 
     clients = [genai.Client(api_key=k) for k in GEMINI_API_KEYS]
-    primary = clients[0]
-
-    return _run_pipeline_steps(clients, primary, prompt, logger)
+    return _run_pipeline_steps(clients, prompt, logger)
 
 
 def _run_pipeline_steps(
     clients: list,
-    primary: type(clients[0]),
     prompt: str,
     logger: logging.Logger,
 ) -> Path:
@@ -257,6 +290,7 @@ def _run_pipeline_steps(
     t0 = time.time()
     metadata = None
     script = None
+    character_bible = None
     scenes = None
     image_prompts = None
     image_paths = None
@@ -270,7 +304,7 @@ def _run_pipeline_steps(
         progress.set_postfix_str("metadata")
         metadata = cache_json(
             OUTPUT_DIR / "metadata.json",
-            lambda: generate_metadata(primary, prompt),
+            lambda: generate_metadata(clients, prompt),
         )
         progress.update(1)
 
@@ -278,33 +312,56 @@ def _run_pipeline_steps(
         progress.set_postfix_str("script")
         script = cache_text(
             OUTPUT_DIR / "script.txt",
-            lambda: generate_script(primary, prompt, metadata["hook"]),
+            lambda: generate_script(clients, prompt, metadata["hook"]),
         )
         progress.update(1)
 
-        # --- Step 3: Scenes (keep original scenes, no splitting) ---
+        # --- Step 3: Character bible (visual continuity for stills + Veo) ---
+        progress.set_postfix_str("character bible")
+        character_bible = cache_json(
+            OUTPUT_DIR / "characters.json",
+            lambda: generate_character_bible(
+                clients,
+                prompt,
+                script,
+                title=(metadata.get("title") or ""),
+                hook=(metadata.get("hook") or ""),
+            ),
+        )
+        progress.update(1)
+
+        # --- Step 4: Scenes (keep original scenes, no splitting) ---
         progress.set_postfix_str("scenes")
+        script_words = max(1, len(script.split()))
+        target_total_seconds = (script_words / float(WORDS_PER_MINUTE)) * 60.0
         scenes = cache_json(
             OUTPUT_DIR / "scenes.json",
-            lambda: generate_scenes(primary, script),
+            lambda: generate_scenes(
+                clients,
+                script,
+                character_bible=character_bible,
+                target_total_seconds=target_total_seconds,
+            ),
         )
         logger.info("Scenes: %d", len(scenes))
         progress.update(1)
 
-        # --- Step 4: Image prompts ---
+        # --- Step 5: Image prompts ---
         progress.set_postfix_str("image prompts")
         image_prompts = cache_json(
             OUTPUT_DIR / "image_prompts.json",
-            lambda: generate_image_prompts(primary, scenes),
+            lambda: generate_image_prompts(
+                clients, scenes, character_bible=character_bible
+            ),
         )
         progress.update(1)
 
-        # --- Step 5: Images (parallel with one key per worker) ---
+        # --- Step 6: Images (parallel with one key per worker) ---
         progress.set_postfix_str("images")
         image_paths = generate_images(clients, image_prompts)
         progress.update(1)
 
-        # --- Step 6: Hero videos (Veo) — try for each scene when HERO_SCENE_COUNT=0 ---
+        # --- Step 7: Hero videos (Veo) — try for each scene when HERO_SCENE_COUNT=0 ---
         progress.set_postfix_str("hero videos")
         hero_scene_ids = pick_hero_scene_ids(scenes, HERO_SCENE_COUNT)
         if hero_scene_ids:
@@ -312,17 +369,31 @@ def _run_pipeline_steps(
                 "Generating hero videos for %d scene(s) (Veo-first; fallback to image for failures) …",
                 len(hero_scene_ids),
             )
-        hero_video_paths = generate_hero_videos(clients, image_prompts, hero_scene_ids)
+        hero_video_paths = generate_hero_videos(
+            clients,
+            image_prompts,
+            hero_scene_ids,
+            scenes,
+            character_bible=character_bible,
+        )
         if hero_video_paths:
-            logger.info("Hero videos ready: %d (scenes %s)", len(hero_video_paths), sorted(hero_video_paths.keys()))
+            n_clips = sum(
+                len(v) if isinstance(v, list) else 1 for v in hero_video_paths.values()
+            )
+            logger.info(
+                "Hero videos ready: %d clip(s) across %d scene(s) %s",
+                n_clips,
+                len(hero_video_paths),
+                sorted(hero_video_paths.keys()),
+            )
         progress.update(1)
 
-        # --- Step 7: Voiceover (round-robin keys) ---
+        # --- Step 8: Voiceover (round-robin keys) ---
         progress.set_postfix_str("voiceover")
         narration_wav, scene_wavs = generate_voiceover(clients, scenes)
         progress.update(1)
 
-        # --- Step 8: Remotion clips for scenes without Veo (real MP4, not Ken Burns on stills) ---
+        # --- Step 9: Remotion clips for scenes without Veo (real MP4, not Ken Burns on stills) ---
         progress.set_postfix_str("remotion")
         remotion_video_paths = render_remotion_for_scenes(
             scenes, image_paths, scene_wavs, hero_video_paths or {}
@@ -334,12 +405,17 @@ def _run_pipeline_steps(
             )
         progress.update(1)
 
-        # --- Step 9: Select music (theme-based; fallback ambient if no files) ---
+        # --- Step 10: Select music (theme-based; fallback ambient if no files) ---
         progress.set_postfix_str("music")
-        bg_music_path = ensure_background_music(scenes=scenes, metadata=metadata)
+        bg_music_path = ensure_background_music(
+            scenes=scenes,
+            metadata=metadata,
+            clients=clients,
+            character_bible=character_bible,
+        )
         progress.update(1)
 
-        # --- Step 10: Build video (Veo > Remotion > image/motion, voiceover, music) ---
+        # --- Step 11: Build video (Veo > Remotion > image/motion, voiceover, music) ---
         progress.set_postfix_str("video")
         video_path = build_video(
             scenes, image_paths, scene_wavs,
@@ -349,7 +425,7 @@ def _run_pipeline_steps(
         )
         progress.update(1)
 
-        # --- Step 11: YouTube title, description, tags, thumbnail (Gemini 4 keys, then NanoBanana) ---
+        # --- Step 12: YouTube title, description, tags, thumbnail (Gemini 4 keys, then NanoBanana) ---
         progress.set_postfix_str("YouTube assets")
         create_youtube_assets(OUTPUT_DIR / "metadata.json", OUTPUT_DIR, clients=clients)
         progress.update(1)
@@ -370,6 +446,8 @@ def _run_pipeline_steps(
     logger.info("SRT    → %s", srt_path)
     logger.info("Audio  → %s", narration_wav)
     logger.info("Meta   → %s", OUTPUT_DIR / "metadata.json")
+    if (OUTPUT_DIR / "characters.json").exists():
+        logger.info("Characters → %s", OUTPUT_DIR / "characters.json")
     if (OUTPUT_DIR / "youtube_title.txt").exists():
         logger.info("YT title → %s", OUTPUT_DIR / "youtube_title.txt")
     if (OUTPUT_DIR / "youtube_description.txt").exists():

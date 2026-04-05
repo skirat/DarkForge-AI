@@ -10,10 +10,12 @@ from moviepy.audio import fx as afx
 from pydub import AudioSegment
 
 from config import (
+    AUDIO_DIR,
     MUSIC_DIR,
     BG_MUSIC_VOLUME,
     BG_MUSIC_DUCKED,
     DUCK_RAMP_SECONDS,
+    LYRIA_BGM,
 )
 
 logger = logging.getLogger("pipeline")
@@ -37,7 +39,11 @@ def _list_tracks(*, include_fallback: bool = False) -> list[Path]:
     return sorted(tracks)
 
 
-def _build_theme_text(scenes: list[dict] | None, metadata: dict | None) -> str:
+def _build_theme_text(
+    scenes: list[dict] | None,
+    metadata: dict | None,
+    character_bible: dict | None = None,
+) -> str:
     """Combine scene content and metadata for theme keyword matching."""
     parts: list[str] = []
     if metadata:
@@ -45,6 +51,11 @@ def _build_theme_text(scenes: list[dict] | None, metadata: dict | None) -> str:
         parts.append(metadata.get("description", ""))
         for tag in metadata.get("tags") or []:
             parts.append(str(tag))
+    if character_bible:
+        p = character_bible.get("protagonist")
+        if isinstance(p, dict):
+            parts.append(str(p.get("name", "")))
+            parts.append(str(p.get("role", "")))
     if scenes:
         for s in scenes:
             parts.append(s.get("visual_prompt", ""))
@@ -74,6 +85,7 @@ def _preferred_horror_tracks(tracks: list[Path]) -> list[Path]:
 def select_track(
     scenes: list[dict] | None = None,
     metadata: dict | None = None,
+    character_bible: dict | None = None,
 ) -> Path | list[Path] | None:
     """Pick background music from assets/music/.
 
@@ -86,7 +98,7 @@ def select_track(
         logger.info("No background music found in %s", MUSIC_DIR)
         return None
 
-    theme_text = _build_theme_text(scenes, metadata)
+    theme_text = _build_theme_text(scenes, metadata, character_bible)
     preferred = _preferred_horror_tracks(tracks)
 
     if preferred and _is_horror_theme(theme_text):
@@ -141,14 +153,30 @@ def _generate_fallback_ambient() -> Path:
 def ensure_background_music(
     scenes: list[dict] | None = None,
     metadata: dict | None = None,
+    clients: list | None = None,
+    character_bible: dict | None = None,
 ) -> Path | list[Path]:
     """Return music track path(s): from assets/music if any, otherwise generated fallback.
+
+    If ``LYRIA_BGM`` is enabled and ``clients`` is provided, tries Lyria 3 (Gemini API)
+    first using story context from *metadata* and *scenes*, then falls back to files.
 
     For horror content may return a list of paths (e.g. both Dark Lurker tracks)
     so the pipeline can cut/stitch segments per story. Call this so the video
     always has background music (voiceover + music).
     """
-    chosen = select_track(scenes=scenes, metadata=metadata)
+    if LYRIA_BGM and clients:
+        from modules import lyria_music
+
+        lyria_path = AUDIO_DIR / "lyria_bgm.mp3"
+        if lyria_music.try_generate_lyria_bed(
+            clients, metadata, scenes, lyria_path, character_bible=character_bible
+        ):
+            return lyria_path
+
+    chosen = select_track(
+        scenes=scenes, metadata=metadata, character_bible=character_bible
+    )
     if chosen is not None:
         return chosen
     return _generate_fallback_ambient()

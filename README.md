@@ -2,7 +2,7 @@
 
 Generate a complete YouTube video from a single text prompt using Google Gemini.
 
-The pipeline handles script writing, scene planning, image generation, voiceover, subtitles, and final video assembly — all automatically. Videos are **5–10 minutes** long with **many scenes** and **rich visuals** (motion, overlays, vignette, transitions).
+The pipeline handles script writing, scene planning, image generation, voiceover, subtitles, and final video assembly — all automatically. Videos are **5–10 minutes** long with **many scenes** and **rich visuals** (motion, overlays, vignette, transitions). Scripts target **clear, simple English** so general viewers can follow the story; technical words are used sparingly and kept understandable.
 
 ## Niche
 
@@ -91,13 +91,14 @@ GEMINI_API_KEY_3=your_third_key
 GEMINI_API_KEY_4=your_fourth_key
 ```
 
+- **Text steps** (metadata, script, character bible, scenes, image prompts): on **429 / RESOURCE_EXHAUSTED**, the pipeline **rotates through all configured keys** with short pauses and many attempts (`utils/gemini_retry.py`), same idea as images/TTS.
 - **Image generation**: uses one key per worker (up to 4 workers).
 - **Voiceover**: scenes are assigned to keys in round-robin.
 - With 4 keys, both steps run up to 4× faster and avoid 429 rate-limit errors.
 
 ## Hero scenes (Veo / Google Labs Flow)
 
-With **`HERO_SCENE_COUNT=0`** (default in `config.py`), the pipeline tries **Veo** for every scene. If Veo fails (quota, etc.), **Remotion** renders a full MP4 for that scene when Node + `remotion_clips` are set up; otherwise the scene uses **image + motion**. Set `HERO_SCENE_COUNT=3` to limit Veo to a subset of scenes (first/middle/last pattern). Veo models are cycled per `VEO_MODELS` in `config.py`.
+With **`HERO_SCENE_COUNT=0`** (default in `config.py`), the pipeline tries **Veo** for every scene. Scene planning uses **only** `duration_seconds` values that are multiples of **`HERO_VEO_CLIP_SEC`** (see `scenes.json`). For each hero scene it requests **multiple distinct clips** when the planned scene duration is longer than **`HERO_VEO_CLIP_SEC`** (~8s default), then **concatenates** them — it does **not** loop the same MP4. If clips are still shorter than final narration, the last frame is **held** (no repeat). If Veo fails (quota, etc.), **Remotion** renders a full MP4 for that scene when Node + `remotion_clips` are set up; otherwise the scene uses **image + motion**. Set `HERO_SCENE_COUNT=3` to limit Veo to a subset of scenes (first/middle/last pattern). Veo models are cycled per `VEO_MODELS` in `config.py`. Cached files use names like `hero_scene_001_p00.mp4`, `hero_scene_001_p01.mp4`. **Retries:** Veo cycles all keys/models up to **`VEO_MAX_ROUNDS`** times with pauses (`VEO_RETRY_ROUND_WAIT_SEC`) between rounds; scene images use **`IMAGE_GEN_MAX_ATTEMPTS`** with pauses after each full key cycle. Tune in `config.py` / `.env`.
 
 ## Background music
 
@@ -122,6 +123,7 @@ DarkForge AI/                  # Project root
 ├── modules/
 │   ├── youtube_metadata.py
 │   ├── script_generator.py
+│   ├── character_bible.py        # Protagonist + style JSON for visual continuity
 │   ├── scene_generator.py
 │   ├── image_prompt_generator.py
 │   ├── image_generator.py
@@ -138,6 +140,7 @@ DarkForge AI/                  # Project root
 │   ├── music/                 # Drop background music here (.mp3/.wav)
 │   └── fonts/                 # Drop a .ttf/.otf font for subtitles
 ├── output/
+│   ├── characters.json           # Story bible (protagonist, supporting, visual_style)
 │   ├── images/
 │   ├── hero_videos/              # Cached Veo clips
 │   ├── remotion_clips/           # Cached Remotion MP4s per scene
@@ -162,13 +165,19 @@ All tuneable parameters live in `config.py`:
 - **Video**: resolution (1920x1080), FPS (30), codec (H.264)
 - **Script**: word count range (1200–1500)
 - **TTS**: voice (`Algenib` by default — gravelly; set `TTS_VOICE` in `.env` for others, e.g. `Charon` narrator, `Gacrux` mature), sample rate (24 kHz)
+- **Edit pacing**: `SCENE_NARRATION_GAP_SEC` (silence + frozen last frame between scenes), `CROSSFADE_DURATION` (visual overlap). Hero→hero cuts use a **fade-from-black** transition.
+- **Lyria BGM** (optional): set `LYRIA_BGM=1` to generate a **30s instrumental** bed from the story via Gemini **Lyria 3 Clip** (`lyria-3-clip-preview`); falls back to `assets/music/` or synthesized ambient if the API fails or quota blocks.
 - **Generation**: retry count (3), thread workers (4), backoff multiplier
 - **Ken Burns**: zoom range (1.0 → 1.15)
 - **Music**: background volume (8%)
 
 ## Caching
 
-Intermediate outputs (metadata, script, scenes, image prompts) are saved as JSON/text in `output/`. Re-running the pipeline skips completed generation steps automatically.
+Intermediate outputs (metadata, script, **characters.json**, scenes, image prompts) are saved as JSON/text in `output/`. Re-running the pipeline skips completed generation steps automatically.
+
+**Character bible:** `output/characters.json` holds the male protagonist, any supporting characters, and shared **visual_style** strings used for Imagen stills and Veo hero clips (plus scene-to-scene continuity hints). If you edit `script.txt` and want the cast and visuals to match the new story, delete `characters.json` and downstream artifacts (`scenes.json`, `image_prompts.json`, images, hero clips) or run with `--fresh`.
+
+**Scene durations / Veo:** In `scenes.json`, each `duration_seconds` is aligned to multiples of **`HERO_VEO_CLIP_SEC`** (default **8** seconds; override in `.env`) up to `MAX_SCENE_DURATION`, so planned hero-clip counts match Veo segment length. The scene planner also targets a total duration near the script’s spoken length (`WORDS_PER_MINUTE`). Final edit timing still follows actual TTS audio.
 
 To regenerate from scratch, delete the `output/` directory.
 

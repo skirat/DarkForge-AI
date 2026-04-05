@@ -18,6 +18,7 @@ from config import (
     ENABLE_REMOTION,
     VIDEO_FPS,
 )
+from modules.hero_video_generator import scene_has_hero_video
 
 logger = logging.getLogger("pipeline")
 
@@ -89,7 +90,7 @@ def render_remotion_for_scenes(
     scenes: list[dict],
     image_paths: list[Path],
     scene_wavs: list[Path],
-    hero_video_paths: dict[int, Path] | None = None,
+    hero_video_paths: dict[int, Path | list[Path]] | None = None,
 ) -> dict[int, Path]:
     """Render Remotion clips for scenes that lack a Veo hero video. Returns scene_id -> mp4 path."""
     hero_video_paths = hero_video_paths or {}
@@ -124,7 +125,7 @@ def render_remotion_for_scenes(
 
     for scene, img_path, wav_path in zip(sorted_scenes, image_paths, scene_wavs):
         scene_id = scene["scene_id"]
-        if scene_id in hero_video_paths and hero_video_paths[scene_id].exists():
+        if scene_has_hero_video(hero_video_paths, scene_id):
             continue
 
         out_path = REMOTION_RENDER_DIR / f"scene_{scene_id:03d}.mp4"
