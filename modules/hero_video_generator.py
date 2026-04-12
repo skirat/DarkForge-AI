@@ -55,31 +55,87 @@ def _snippet_visual(scene: dict | None, max_len: int) -> str:
     return vp[: max_len - 1] + "…"
 
 
+def _scene_has_any_character(scene: dict | None) -> bool:
+    """True when characters_present lists at least one id (visible cast on screen)."""
+    if not scene:
+        return False
+    cp = scene.get("characters_present")
+    if not isinstance(cp, list):
+        return False
+    return len(cp) > 0
+
+
 def _include_protagonist_lock(scene: dict) -> bool:
-    """True unless characters_present is an explicit empty list (no people on screen)."""
+    """True only when protagonist is explicitly listed in characters_present."""
     cp = scene.get("characters_present")
     if cp is None:
-        return True
+        return False
     if not isinstance(cp, list):
-        return True
+        return False
     if len(cp) == 0:
         return False
     return any(str(x).strip().lower() == "protagonist" for x in cp)
 
 
-def _intra_scene_shot_directive(part_index: int, total_parts: int) -> str:
+def _intra_scene_shot_directive(
+    part_index: int,
+    total_parts: int,
+    scene: dict | None = None,
+) -> str:
     """Strong, distinct cinematography per clip within ONE scene — avoids repetitive hero parts.
 
     Character appearance stays identical via bible locks; only camera, lens, motion, and beat change.
+    For no-character scenes, directives avoid faces/bodies and emphasize environment and inserts.
     """
     if total_parts <= 1:
         return ""
     i = part_index
     n = total_parts
+    no_people = scene is not None and not _scene_has_any_character(scene)
     anti = (
         "ANTI-REPEAT: This clip must NOT reuse the same framing, height, distance, or motion as "
         "the other clips for this scene — each segment is different coverage of the same moment."
     )
+    if no_people:
+        if n == 2:
+            pair = [
+                (
+                    "INTRA-SCENE SHOT 1/2 — ESTABLISHING: wide; architecture, weather, or room geography; "
+                    "no people; slow drift or tripod."
+                ),
+                (
+                    "INTRA-SCENE SHOT 2/2 — ALT COVERAGE: new angle or focal plane; props, screen glow, "
+                    "texture, or symbolic object — NOT a reshoot of shot 1."
+                ),
+            ]
+            return anti + "\n" + pair[min(i, 1)]
+        if n == 3:
+            triple = [
+                (
+                    "INTRA-SCENE SHOT 1/3 — MASTER: wide/medium-wide; space and light; establish mood; no figures."
+                ),
+                (
+                    "INTRA-SCENE SHOT 2/3 — COVERAGE: medium; NEW angle; emphasize objects, corridor depth, "
+                    "or monitor/UI glow — distinct from shot 1."
+                ),
+                (
+                    "INTRA-SCENE SHOT 3/3 — DETAIL: close insert of object, rain on glass, cable, LED, "
+                    "or abstract texture — shallow DOF; NOT matching 1 or 2."
+                ),
+            ]
+            return anti + "\n" + triple[min(i, 2)]
+        cycle = [
+            "INTRA-SCENE — WIDE: environment only; establish.",
+            "INTRA-SCENE — MEDIUM: new angle; objects and space; no bodies.",
+            "INTRA-SCENE — CLOSE/INSERT: prop, screen edge, texture, or symbolic detail.",
+            "INTRA-SCENE — ACCENT: low/high angle, foreground frame, slow slide — fresh beat.",
+        ]
+        return (
+            anti
+            + "\n"
+            + cycle[i % len(cycle)]
+            + f" (segment {i + 1}/{n}; must differ from all other segments)."
+        )
     if n == 2:
         pair = [
             (
@@ -123,8 +179,10 @@ def _intra_scene_shot_directive(part_index: int, total_parts: int) -> str:
     )
 
 
-def _identity_variation_reminder(total_parts: int) -> str:
+def _identity_variation_reminder(total_parts: int, scene: dict | None = None) -> str:
     if total_parts <= 1:
+        return ""
+    if scene is not None and not _scene_has_any_character(scene):
         return ""
     return (
         "Identity: same face, hair, skin, and wardrobe as bible — only camera, lens, motion, "
@@ -226,8 +284,8 @@ def build_veo_prompt(
     suffix sat last and was often truncated, producing duplicate-looking clips).
     """
     lock_lines = _character_lock_lines(character_bible, scene)
-    intra = _intra_scene_shot_directive(part_index, total_parts)
-    ident = _identity_variation_reminder(total_parts)
+    intra = _intra_scene_shot_directive(part_index, total_parts, scene=scene)
+    ident = _identity_variation_reminder(total_parts, scene=scene)
 
     head_chunks: list[str] = []
     if lock_lines:
@@ -275,6 +333,36 @@ def pick_hero_scene_ids(scenes: list[dict], hero_count: int) -> list[int]:
     """Return list of scene_id values (1-based) to use as hero (Veo) scenes."""
     n = len(scenes)
     return _pick_hero_indices(n, hero_count)
+
+
+def hero_scene_ids_with_complete_hero_files(
+    scenes: list[dict],
+    hero_scene_ids: list[int],
+    output_dir: Path | None = None,
+) -> set[int]:
+    """Scene IDs in *hero_scene_ids* whose expected hero MP4s already exist on disk (all parts)."""
+    output_dir = output_dir or HERO_VIDEOS_DIR
+    by_id = {
+        int(s["scene_id"]): s
+        for s in scenes
+        if isinstance(s, dict) and s.get("scene_id") is not None
+    }
+    complete: set[int] = set()
+    for sid in hero_scene_ids:
+        sid = int(sid)
+        scene = by_id.get(sid)
+        if not scene:
+            continue
+        n_parts = _parts_for_scene_duration(_scene_duration_sec(scene))
+        ok = True
+        for part in range(n_parts):
+            pth = _hero_dest_path(output_dir, sid, part)
+            if not pth.is_file():
+                ok = False
+                break
+        if ok:
+            complete.add(sid)
+    return complete
 
 
 def _is_quota_exhausted(exc: BaseException) -> bool:

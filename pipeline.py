@@ -20,6 +20,7 @@ from google import genai  # noqa: E402
 from google.genai import types  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
+import config  # noqa: E402 — mutate IMAGE_MODEL after probe; modules read config.IMAGE_MODEL at runtime
 from config import (  # noqa: E402
     GEMINI_API_KEY,
     GEMINI_API_KEYS,
@@ -34,16 +35,19 @@ from config import (  # noqa: E402
     REMOTION_RENDER_DIR,
     HERO_SCENE_COUNT,
     TEXT_MODEL,
-    IMAGE_MODEL,
     WORDS_PER_MINUTE,
 )
 from utils.logger import setup_logger  # noqa: E402
-from utils.file_utils import ensure_dirs, cache_json, cache_text  # noqa: E402
+from utils.file_utils import ensure_dirs, cache_json, cache_text, save_json  # noqa: E402
 
 from modules.youtube_metadata import generate_metadata  # noqa: E402
 from modules.script_generator import generate_script  # noqa: E402
 from modules.character_bible import generate_character_bible  # noqa: E402
-from modules.scene_generator import generate_scenes  # noqa: E402
+from modules.scene_generator import (  # noqa: E402
+    generate_scenes,
+    expand_scenes_to_veo_segments,
+)
+from modules.protagonist_sparsity import apply_protagonist_sparsity  # noqa: E402
 from modules.image_prompt_generator import generate_image_prompts  # noqa: E402
 from modules.image_generator import generate_images  # noqa: E402
 from modules.voiceover_generator import generate_voiceover  # noqa: E402
@@ -51,10 +55,12 @@ from modules.music_manager import ensure_background_music  # noqa: E402
 from modules.hero_video_generator import (  # noqa: E402
     pick_hero_scene_ids,
     generate_hero_videos,
+    hero_scene_ids_with_complete_hero_files,
 )
 from modules.remotion_renderer import render_remotion_for_scenes  # noqa: E402
 from modules.video_builder import build_video  # noqa: E402
 from modules.youtube_assets import create_youtube_assets  # noqa: E402
+from modules.manual_video_prompts import write_manual_video_prompts  # noqa: E402
 
 STEPS = [
     "Generate metadata",
@@ -62,6 +68,7 @@ STEPS = [
     "Generate character bible",
     "Break into scenes",
     "Create image prompts",
+    "Export manual video prompts",
     "Generate images",
     "Generate hero videos (Veo)",
     "Generate voiceover",
@@ -131,17 +138,17 @@ def validate_api_keys(keys: list[str], logger: logging.Logger) -> list[tuple[str
 
 def validate_image_model(client: genai.Client, logger: logging.Logger) -> str | None:
     """Test that the image model works with this client. Returns error message if it fails."""
-    use_imagen = IMAGE_MODEL.startswith("imagen-")
+    use_imagen = config.IMAGE_MODEL.startswith("imagen-")
     try:
         if use_imagen:
             client.models.generate_images(
-                model=IMAGE_MODEL,
+                model=config.IMAGE_MODEL,
                 prompt="A single red apple on a white background.",
                 config=types.GenerateImagesConfig(number_of_images=1, aspect_ratio="16:9"),
             )
         else:
             r = client.models.generate_content(
-                model=IMAGE_MODEL,
+                model=config.IMAGE_MODEL,
                 contents="A single red apple on a white background.",
                 config=types.GenerateContentConfig(
                     response_modalities=["IMAGE"],
@@ -212,7 +219,7 @@ def run_pipeline(prompt: str, *, fresh: bool = False) -> Path:
     else:
         logger.info("All API keys valid.")
 
-    logger.info("Checking image model (%s) with all keys …", IMAGE_MODEL)
+    logger.info("Checking image model (%s) on every key …", config.IMAGE_MODEL)
     image_failures: list[tuple[str, str]] = []
     for i, api_key in enumerate(GEMINI_API_KEYS):
         label = _api_key_label(i)
@@ -220,9 +227,32 @@ def run_pipeline(prompt: str, *, fresh: bool = False) -> Path:
         err = validate_image_model(client, logger)
         if err is None:
             logger.info("Image model OK (%s).", label)
-            break
-        image_failures.append((label, err))
-    else:
+        else:
+            image_failures.append((label, err))
+            logger.warning(
+                "Image model check failed (%s): %s",
+                label,
+                err[:200] + ("..." if len(err) > 200 else ""),
+            )
+
+    if image_failures and len(image_failures) < len(GEMINI_API_KEYS):
+        if config.IMAGE_MODEL.startswith("imagen-"):
+            # Workers round-robin keys; Imagen must work on every key or we use native Gemini image.
+            logger.warning(
+                "Imagen failed on %d/%d key(s) — switching to gemini-2.5-flash-image for this run "
+                "(set IMAGE_MODEL in .env to override).",
+                len(image_failures),
+                len(GEMINI_API_KEYS),
+            )
+            config.IMAGE_MODEL = "gemini-2.5-flash-image"
+        else:
+            logger.warning(
+                "Some keys failed the image check (%d/%d); generation will rotate keys.",
+                len(image_failures),
+                len(GEMINI_API_KEYS),
+            )
+
+    if image_failures and len(image_failures) == len(GEMINI_API_KEYS):
         # all keys failed
         if OPENAI_ENABLED:
             logger.warning("=" * 60)
@@ -233,11 +263,17 @@ def run_pipeline(prompt: str, *, fresh: bool = False) -> Path:
             logger.warning("=" * 60)
             for label, err in image_failures:
                 logger.warning("  %s: %s", label, err[:200] + ("..." if len(err) > 200 else ""))
+            # Imagen requires a paid plan; keep running with Gemini native image + OpenAI fallback per scene.
+            config.IMAGE_MODEL = "gemini-2.5-flash-image"
+            logger.info(
+                "Switched IMAGE_MODEL to %s for this run (set IMAGE_MODEL in .env to override).",
+                config.IMAGE_MODEL,
+            )
         else:
             logger.error("=" * 60)
             logger.error("IMAGE MODEL CHECK FAILED (all %d key(s))", len(GEMINI_API_KEYS))
             logger.error("=" * 60)
-            logger.error("Model: %s", IMAGE_MODEL)
+            logger.error("Model: %s", config.IMAGE_MODEL)
             for label, err in image_failures:
                 logger.error("  %s: %s", label, err[:200] + ("..." if len(err) > 200 else ""))
             logger.error("")
@@ -256,7 +292,7 @@ def run_pipeline(prompt: str, *, fresh: bool = False) -> Path:
             )
             print(
                 f"\n{'=' * 60}\nIMAGE MODEL CHECK FAILED (all keys)\n{'=' * 60}\n"
-                f"Model: {IMAGE_MODEL}\n\n{msg}\n\n"
+                f"Model: {config.IMAGE_MODEL}\n\n{msg}\n\n"
                 "None of your keys have image quota or access for this model.\n"
                 "Wait for quota reset, set OPENAI_API_KEY, or try again later.\n" + "=" * 60,
                 file=sys.stderr,
@@ -330,19 +366,27 @@ def _run_pipeline_steps(
         )
         progress.update(1)
 
-        # --- Step 4: Scenes (keep original scenes, no splitting) ---
+        # --- Step 4: Scenes (planner) then expand to ~HERO_VEO_CLIP_SEC rows with per-segment video prompts ---
         progress.set_postfix_str("scenes")
         script_words = max(1, len(script.split()))
         target_total_seconds = (script_words / float(WORDS_PER_MINUTE)) * 60.0
         scenes = cache_json(
             OUTPUT_DIR / "scenes.json",
-            lambda: generate_scenes(
+            lambda: expand_scenes_to_veo_segments(
                 clients,
-                script,
+                generate_scenes(
+                    clients,
+                    script,
+                    character_bible=character_bible,
+                    target_total_seconds=target_total_seconds,
+                ),
                 character_bible=character_bible,
-                target_total_seconds=target_total_seconds,
             ),
         )
+        scenes = apply_protagonist_sparsity(
+            scenes, character_bible, metadata, script=script or ""
+        )
+        save_json(OUTPUT_DIR / "scenes.json", scenes)
         logger.info("Scenes: %d", len(scenes))
         progress.update(1)
 
@@ -356,14 +400,31 @@ def _run_pipeline_steps(
         )
         progress.update(1)
 
-        # --- Step 6: Images (parallel with one key per worker) ---
-        progress.set_postfix_str("images")
-        image_paths = generate_images(clients, image_prompts)
+        # --- Step 6: Manual video prompts (JSON + TXT for external Veo / Runway / etc.) ---
+        progress.set_postfix_str("manual video prompts")
+        write_manual_video_prompts(
+            OUTPUT_DIR, scenes, character_bible, metadata, image_prompts, logger
+        )
         progress.update(1)
 
-        # --- Step 7: Hero videos (Veo) — try for each scene when HERO_SCENE_COUNT=0 ---
-        progress.set_postfix_str("hero videos")
+        # --- Step 7: Images (parallel with one key per worker) ---
+        progress.set_postfix_str("images")
         hero_scene_ids = pick_hero_scene_ids(scenes, HERO_SCENE_COUNT)
+        skip_img_for = hero_scene_ids_with_complete_hero_files(
+            scenes, hero_scene_ids, HERO_VIDEOS_DIR
+        )
+        if skip_img_for:
+            logger.info(
+                "Hero MP4s already on disk for %d scene(s); skipping image API for those (cached PNG or placeholder)",
+                len(skip_img_for),
+            )
+        image_paths = generate_images(
+            clients, image_prompts, skip_api_for_scene_ids=skip_img_for
+        )
+        progress.update(1)
+
+        # --- Step 8: Hero videos (Veo) — try for each scene when HERO_SCENE_COUNT=0 ---
+        progress.set_postfix_str("hero videos")
         if hero_scene_ids:
             logger.info(
                 "Generating hero videos for %d scene(s) (Veo-first; fallback to image for failures) …",
@@ -388,12 +449,12 @@ def _run_pipeline_steps(
             )
         progress.update(1)
 
-        # --- Step 8: Voiceover (round-robin keys) ---
+        # --- Step 9: Voiceover (round-robin keys) ---
         progress.set_postfix_str("voiceover")
         narration_wav, scene_wavs = generate_voiceover(clients, scenes)
         progress.update(1)
 
-        # --- Step 9: Remotion clips for scenes without Veo (real MP4, not Ken Burns on stills) ---
+        # --- Step 10: Remotion clips for scenes without Veo (real MP4, not Ken Burns on stills) ---
         progress.set_postfix_str("remotion")
         remotion_video_paths = render_remotion_for_scenes(
             scenes, image_paths, scene_wavs, hero_video_paths or {}
@@ -405,7 +466,7 @@ def _run_pipeline_steps(
             )
         progress.update(1)
 
-        # --- Step 10: Select music (theme-based; fallback ambient if no files) ---
+        # --- Step 11: Select music (theme-based; fallback ambient if no files) ---
         progress.set_postfix_str("music")
         bg_music_path = ensure_background_music(
             scenes=scenes,
@@ -415,7 +476,7 @@ def _run_pipeline_steps(
         )
         progress.update(1)
 
-        # --- Step 11: Build video (Veo > Remotion > image/motion, voiceover, music) ---
+        # --- Step 12: Build video (Veo > Remotion > image/motion, voiceover, music) ---
         progress.set_postfix_str("video")
         video_path = build_video(
             scenes, image_paths, scene_wavs,
@@ -425,7 +486,7 @@ def _run_pipeline_steps(
         )
         progress.update(1)
 
-        # --- Step 12: YouTube title, description, tags, thumbnail (Gemini 4 keys, then NanoBanana) ---
+        # --- Step 13: YouTube title, description, tags, thumbnail (Gemini 4 keys, then NanoBanana) ---
         progress.set_postfix_str("YouTube assets")
         create_youtube_assets(OUTPUT_DIR / "metadata.json", OUTPUT_DIR, clients=clients)
         progress.update(1)
@@ -448,6 +509,13 @@ def _run_pipeline_steps(
     logger.info("Meta   → %s", OUTPUT_DIR / "metadata.json")
     if (OUTPUT_DIR / "characters.json").exists():
         logger.info("Characters → %s", OUTPUT_DIR / "characters.json")
+    if (OUTPUT_DIR / "manual_video_prompts.json").exists():
+        logger.info("Manual video prompts (JSON) → %s", OUTPUT_DIR / "manual_video_prompts.json")
+    if (OUTPUT_DIR / "manual_video_prompts.txt").exists():
+        logger.info("Manual video prompts (index) → %s", OUTPUT_DIR / "manual_video_prompts.txt")
+    clips_idx = OUTPUT_DIR / "manual_video_prompts" / "clips"
+    if clips_idx.is_dir():
+        logger.info("Manual video prompts (per-clip copy-paste) → %s", clips_idx)
     if (OUTPUT_DIR / "youtube_title.txt").exists():
         logger.info("YT title → %s", OUTPUT_DIR / "youtube_title.txt")
     if (OUTPUT_DIR / "youtube_description.txt").exists():

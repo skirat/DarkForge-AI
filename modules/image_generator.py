@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Set
 
 import requests
 from google import genai
 from google.genai import types
 
+import config
 from config import (
-    IMAGE_MODEL,
     IMAGES_DIR,
     IMAGE_WORKERS,
     IMAGE_GEN_MAX_ATTEMPTS,
@@ -33,6 +35,8 @@ NANOBANANA_RETRY_WAIT_SEC = 8.0
 def _is_transient_image_error(exc: BaseException) -> bool:
     """Quota, rate limits, overload — worth another key or later attempt."""
     msg = str(exc).lower()
+    if "no image in response" in msg or "no image part in response" in msg:
+        return True
     return any(
         x in msg
         for x in (
@@ -49,6 +53,52 @@ def _is_transient_image_error(exc: BaseException) -> bool:
             "too many requests",
         )
     )
+
+
+def _gemini_image_error_skip_to_openai(exc: BaseException) -> bool:
+    """Plan/access errors that won't fix by retrying Imagen/Gemini with the same keys."""
+    msg = str(exc).lower()
+    if "api_key_service_blocked" in msg:
+        return True
+    if "only available on paid plans" in msg:
+        return True
+    if "permission_denied" in msg and "blocked" in msg:
+        return True
+    if "imagen returned no image" in msg or "imagen returned empty" in msg:
+        return True
+    return False
+
+
+_IMAGEM_DOWNGRADE_LOCK = threading.Lock()
+
+
+def _downgrade_from_imagen_if_needed(exc: BaseException) -> bool:
+    """Once per process: switch from Imagen to Gemini native image when Imagen cannot be used."""
+    if not config.IMAGE_MODEL.startswith("imagen-"):
+        return False
+    if not _gemini_image_error_skip_to_openai(exc):
+        return False
+    with _IMAGEM_DOWNGRADE_LOCK:
+        if not config.IMAGE_MODEL.startswith("imagen-"):
+            return False
+        config.IMAGE_MODEL = "gemini-2.5-flash-image"
+        logger.warning(
+            "Switched IMAGE_MODEL to %s — Imagen not usable for this key/account (retrying with native image).",
+            config.IMAGE_MODEL,
+        )
+        return True
+
+
+def _save_imagen_response_to_file(response, dest: Path) -> None:
+    """Save first image from generate_images response; raise if empty or malformed."""
+    imgs = getattr(response, "generated_images", None) or []
+    if not imgs or imgs[0] is None:
+        raise ValueError("Imagen returned no image")
+    first = imgs[0]
+    img = getattr(first, "image", None)
+    if img is None:
+        raise ValueError("Imagen returned empty image object")
+    img.save(str(dest))
 
 NANOBANANA_BASE = "https://api.nanobananaapi.ai"
 NANOBANANA_POLL_INTERVAL = 3.0
@@ -72,24 +122,24 @@ def generate_single_image_gemini(
 
             return generate_openai_image(prompt, dest, label="thumbnail")
         return False
-    use_imagen = IMAGE_MODEL.startswith("imagen-")
     n_clients = len(clients)
     for attempt in range(1, MAX_RETRIES + 1):
         client = clients[(attempt - 1) % n_clients]
+        use_imagen = config.IMAGE_MODEL.startswith("imagen-")
         try:
             if use_imagen:
                 response = client.models.generate_images(
-                    model=IMAGE_MODEL,
+                    model=config.IMAGE_MODEL,
                     prompt=prompt,
                     config=types.GenerateImagesConfig(
                         number_of_images=1,
                         aspect_ratio="16:9",
                     ),
                 )
-                response.generated_images[0].image.save(str(dest))
+                _save_imagen_response_to_file(response, dest)
             else:
                 response = client.models.generate_content(
-                    model=IMAGE_MODEL,
+                    model=config.IMAGE_MODEL,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         response_modalities=["IMAGE"],
@@ -100,6 +150,8 @@ def generate_single_image_gemini(
             logger.info("Thumbnail from Gemini → %s", dest.name)
             return True
         except Exception as exc:
+            if _downgrade_from_imagen_if_needed(exc):
+                continue
             err_msg = str(exc).strip() or type(exc).__name__
             err_safe = err_msg.replace("%", "%%")[:200]
             is_rate_limit = "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg
@@ -111,6 +163,11 @@ def generate_single_image_gemini(
                 wait,
             )
             time.sleep(wait)
+            if OPENAI_ENABLED and _gemini_image_error_skip_to_openai(exc):
+                from modules.openai_image import generate_openai_image
+
+                if generate_openai_image(prompt, dest, label="thumbnail"):
+                    return True
     if OPENAI_ENABLED:
         from modules.openai_image import generate_openai_image
 
@@ -178,11 +235,25 @@ def _try_nanobanana(prompt: str, dest: Path) -> bool:
 
 def _save_image_from_content_response(response, dest: Path) -> None:
     """Extract first image from generate_content response and save to dest."""
-    if not response.candidates or not response.candidates[0].content.parts:
-        raise ValueError("No image in response")
-    for part in response.candidates[0].content.parts:
-        if part.inline_data and part.inline_data.data:
-            dest.write_bytes(part.inline_data.data)
+    cands = getattr(response, "candidates", None) or []
+    if not cands:
+        raise ValueError("No image in response (no candidates)")
+    first = cands[0]
+    if first is None:
+        raise ValueError("No image in response (empty candidate)")
+    content = getattr(first, "content", None)
+    if content is None:
+        raise ValueError("No image in response (no content)")
+    parts = getattr(content, "parts", None) or []
+    if not parts:
+        raise ValueError("No image in response (no parts)")
+    for part in parts:
+        inline = getattr(part, "inline_data", None)
+        if inline is None:
+            continue
+        data = getattr(inline, "data", None)
+        if data:
+            dest.write_bytes(data)
             return
     raise ValueError("No image part in response")
 
@@ -193,6 +264,8 @@ def _generate_single(
     scene_id: int,
     prompt: str,
     output_dir: Path,
+    *,
+    skip_api: bool = False,
 ) -> Path:
     """Generate one image with retry logic. On 429, rotates to the next API key. Returns the saved file path."""
     filename = f"scene_{scene_id:03d}.png"
@@ -201,6 +274,13 @@ def _generate_single(
     if dest.exists():
         logger.debug("Cached image for scene %d", scene_id)
         return dest
+
+    if skip_api:
+        logger.info(
+            "Skipping image API for scene %d (hero video already on disk) → placeholder",
+            scene_id,
+        )
+        return _create_placeholder(dest)
 
     # 1. Try NanoBanana first (if configured) — a few attempts with backoff
     if NANOBANANA_API_KEY:
@@ -225,7 +305,6 @@ def _generate_single(
                 time.sleep(NANOBANANA_RETRY_WAIT_SEC)
 
     # 2. Gemini / Imagen: rotate keys many times; pause between full key cycles on quota
-    use_imagen = IMAGE_MODEL.startswith("imagen-")
     last_err: Exception | None = None
     n_clients = len(clients)
 
@@ -240,22 +319,23 @@ def _generate_single(
     attempt = 0
 
     while attempt < max_attempts:
+        use_imagen = config.IMAGE_MODEL.startswith("imagen-")
         client = clients[(key_index + attempt) % n_clients]
         key_slot = (key_index + attempt) % n_clients + 1
         try:
             if use_imagen:
                 response = client.models.generate_images(
-                    model=IMAGE_MODEL,
+                    model=config.IMAGE_MODEL,
                     prompt=prompt,
                     config=types.GenerateImagesConfig(
                         number_of_images=1,
                         aspect_ratio="16:9",
                     ),
                 )
-                response.generated_images[0].image.save(str(dest))
+                _save_imagen_response_to_file(response, dest)
             else:
                 response = client.models.generate_content(
-                    model=IMAGE_MODEL,
+                    model=config.IMAGE_MODEL,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         response_modalities=["IMAGE"],
@@ -267,6 +347,17 @@ def _generate_single(
             return dest
         except Exception as exc:
             last_err = exc
+            if OPENAI_ENABLED and _gemini_image_error_skip_to_openai(exc):
+                from modules.openai_image import generate_openai_image
+
+                if generate_openai_image(prompt, dest, label=f"scene {scene_id}"):
+                    logger.info(
+                        "Scene %d image saved via OpenAI (Gemini Imagen/plan blocked for this key)",
+                        scene_id,
+                    )
+                    return dest
+            if _downgrade_from_imagen_if_needed(exc):
+                continue
             attempt += 1
             err_msg = str(exc).strip() or type(exc).__name__
             if len(err_msg) > 200:
@@ -352,14 +443,35 @@ def generate_images(
     clients: list[genai.Client],
     image_prompts: list[dict],
     output_dir: Path | None = None,
+    *,
+    skip_api_for_scene_ids: Set[int] | None = None,
 ) -> list[Path]:
-    """Generate images in parallel. Uses one client (API key) per worker to avoid rate limits."""
+    """Generate images in parallel. Uses one client (API key) per worker to avoid rate limits.
+
+    When *skip_api_for_scene_ids* contains a scene_id, skip Gemini/OpenAI/NanoBanana for that
+    scene and use a cached PNG if present, else a black placeholder (e.g. hero MP4 already exists).
+    """
     output_dir = output_dir or IMAGES_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
     clients = clients or []  # allow single-client callers to pass [client]
-    if not clients and not OPENAI_ENABLED and not NANOBANANA_API_KEY:
+    skip_api_for_scene_ids = skip_api_for_scene_ids or set()
+
+    needs_api = any(
+        int(p["scene_id"]) not in skip_api_for_scene_ids for p in image_prompts
+    )
+    if needs_api and not clients and not OPENAI_ENABLED and not NANOBANANA_API_KEY:
         raise ValueError(
             "Need at least one GEMINI_API_KEY, or set OPENAI_API_KEY / NANOBANANA_API_KEY for images"
+        )
+
+    n_skip = sum(
+        1 for p in image_prompts if int(p["scene_id"]) in skip_api_for_scene_ids
+    )
+    if n_skip:
+        logger.info(
+            "Skipping image API for %d/%d scene(s) with hero video(s) already on disk",
+            n_skip,
+            len(image_prompts),
         )
 
     n_keys = max(1, len(clients))
@@ -377,15 +489,17 @@ def generate_images(
         futures = {}
         for i, p in enumerate(image_prompts):
             key_index = i % n_keys if clients else 0
+            sid = int(p["scene_id"])
             fut = pool.submit(
                 _generate_single,
                 clients,
                 key_index,
-                p["scene_id"],
+                sid,
                 p["image_prompt"],
                 output_dir,
+                skip_api=sid in skip_api_for_scene_ids,
             )
-            futures[fut] = p["scene_id"]
+            futures[fut] = sid
         for future in as_completed(futures):
             sid = futures[future]
             paths[sid] = future.result()

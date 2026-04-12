@@ -10,9 +10,26 @@ from config import OPENAI_API_KEY, OPENAI_IMAGE_MODEL
 
 logger = logging.getLogger("pipeline")
 
+try:
+    import openai  # noqa: F401
+
+    OPENAI_PACKAGE_AVAILABLE = True
+except ImportError:
+    OPENAI_PACKAGE_AVAILABLE = False
+
+_openai_missing_logged = False
+
 
 def generate_openai_image(prompt: str, dest: Path, *, label: str = "image") -> bool:
     """Generate one 16:9 image via OpenAI Images API; save PNG to *dest*. Returns True on success."""
+    global _openai_missing_logged
+    if not OPENAI_PACKAGE_AVAILABLE:
+        if not _openai_missing_logged:
+            logger.warning(
+                "OpenAI image fallback skipped: install the package with pip install openai (see requirements.txt)."
+            )
+            _openai_missing_logged = True
+        return False
     if not OPENAI_API_KEY:
         return False
     dest = Path(dest)

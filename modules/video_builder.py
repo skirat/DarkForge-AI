@@ -4,6 +4,7 @@ animated subtitles, audio ducking, SFX, and color grading.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -182,16 +183,33 @@ def _silent_audio_clip(duration_sec: float, ref: AudioFileClip) -> AudioFileClip
 
 
 def _extend_video_to_speech_duration(bg: VideoClip, speech_dur: float) -> VideoClip:
-    """Trim long clips; if short, hold last frame instead of looping the same clip."""
-    if bg.duration > speech_dur:
+    """Trim long clips to narration length.
+
+    If the clip is longer than *speech_dur*, use the opening segment only.
+
+    If shorter: start at the midpoint, play to the end, then play from the start to the
+    midpoint (full footage in a new order, no frozen frame). Repeat that cycle until
+    *speech_dur* is covered, then trim.
+    """
+    if speech_dur <= 0:
+        return bg
+    D = float(bg.duration)
+    if D <= 0:
+        return bg
+    if D >= speech_dur:
         return bg.subclipped(0, speech_dur)
-    if bg.duration < speech_dur:
-        short = speech_dur - float(bg.duration)
-        t = max(0.0, float(bg.duration) - 1.0 / max(VIDEO_FPS, 1))
-        frame = bg.get_frame(t)
-        tail = ImageClip(frame).with_duration(short).with_fps(VIDEO_FPS)
-        return concatenate_videoclips([bg, tail])
-    return bg
+
+    mid = D / 2.0
+    part_a = bg.subclipped(mid, D)
+    part_b = bg.subclipped(0, mid)
+    cycle = concatenate_videoclips([part_a, part_b])
+    c_len = float(cycle.duration)
+    if c_len <= 1e-6:
+        return bg.subclipped(0, min(D, speech_dur))
+
+    n = max(1, int(math.ceil(speech_dur / c_len)))
+    long_bg = concatenate_videoclips([cycle] * n)
+    return long_bg.subclipped(0, speech_dur)
 
 
 def _append_freeze_last_frame(clip: VideoClip, gap: float, fps: int) -> VideoClip:
@@ -294,7 +312,7 @@ def build_video(
         from_remotion_bg = False
         hero_paths = get_hero_paths_for_scene(hero_video_paths, scene_id)
         if hero_paths:
-            # Hero: concatenate distinct Veo clips in order; freeze last frame if still short (no loop)
+            # Hero: concatenate distinct Veo clips; if still shorter than VO, middle→end then start→middle, loop
             clips_v = [VideoFileClip(str(p)).with_fps(VIDEO_FPS) for p in hero_paths]
             bg = concatenate_videoclips(clips_v)
             bg = bg.with_effects([vfx.Resize((VIDEO_WIDTH, VIDEO_HEIGHT))])

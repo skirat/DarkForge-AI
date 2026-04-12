@@ -92,6 +92,9 @@ VEO_POLL_TIMEOUT_SEC = max(120, int(os.getenv("VEO_POLL_TIMEOUT_SEC", "600") or 
 VEO_MAX_ROUNDS = max(1, int(os.getenv("VEO_MAX_ROUNDS", "6") or 6))
 VEO_RETRY_ROUND_WAIT_SEC = float(os.getenv("VEO_RETRY_ROUND_WAIT_SEC", "90") or 90)
 VEO_KEY_COOLDOWN_SEC = float(os.getenv("VEO_KEY_COOLDOWN_SEC", "15") or 15)
+# Fraction of Veo segment rows that keep planner character tags; rest use no-people, narration-led visuals.
+_raw_pcr = float(os.getenv("PROTAGONIST_CLIP_RATIO", "0.25") or 0.25)
+PROTAGONIST_CLIP_RATIO = max(0.05, min(0.5, _raw_pcr))
 
 # --- Remotion (video clips when Veo unavailable; requires Node + npm install in remotion_clips/) ---
 ENABLE_REMOTION = os.getenv("ENABLE_REMOTION", "1").strip().lower() in ("1", "true", "yes")

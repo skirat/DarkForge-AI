@@ -30,6 +30,9 @@ remotion_clips/public/shorts/source.mp4
 remotion_clips/public/df_render/*
 !remotion_clips/public/df_render/.gitkeep
 
+# Temp / partial asset exports
+*.tmp
+
 # IDE / OS
 .idea/
 .vscode/
